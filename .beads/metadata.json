@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "oci_auto_http",
+  "project_id": "49eed392-67fb-4937-9a9c-3c1e5f0eeac9"
+}
