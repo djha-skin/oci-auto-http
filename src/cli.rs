@@ -64,6 +64,9 @@ pub struct ServeArgs {
     /// Maximum idle time between HTTP response chunks, in seconds (1-3600).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub stream_idle_timeout_seconds: Option<u64>,
+    /// Maximum time to drain in-flight requests after SIGTERM or Ctrl-C (1-3600 seconds).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub graceful_shutdown_timeout_seconds: Option<u64>,
     /// Maximum rendered byte size of one directory autoindex spool.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
     pub max_autoindex_spool_bytes: Option<u64>,

@@ -15,6 +15,7 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_REGISTRY_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_AUTOINDEX_SPOOL_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_AUTOINDEX_SPOOL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 1024;
@@ -35,6 +36,7 @@ pub struct ServerSettings {
     pub request_timeout: Duration,
     pub registry_request_timeout: Duration,
     pub stream_idle_timeout: Duration,
+    pub graceful_shutdown_timeout: Duration,
     pub max_autoindex_spool_bytes: u64,
     pub max_autoindex_spool_total_bytes: u64,
 }
@@ -102,6 +104,7 @@ struct RawServer {
     request_timeout_seconds: Option<u64>,
     registry_request_timeout_seconds: Option<u64>,
     stream_idle_timeout_seconds: Option<u64>,
+    graceful_shutdown_timeout_seconds: Option<u64>,
     max_autoindex_spool_bytes: Option<u64>,
     max_autoindex_spool_total_bytes: Option<u64>,
 }
@@ -114,6 +117,7 @@ impl Default for RawServer {
             request_timeout_seconds: Some(DEFAULT_REQUEST_TIMEOUT_SECONDS),
             registry_request_timeout_seconds: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT_SECONDS),
             stream_idle_timeout_seconds: Some(DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS),
+            graceful_shutdown_timeout_seconds: Some(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS),
             max_autoindex_spool_bytes: Some(DEFAULT_MAX_AUTOINDEX_SPOOL_BYTES),
             max_autoindex_spool_total_bytes: Some(DEFAULT_MAX_AUTOINDEX_SPOOL_TOTAL_BYTES),
         }
@@ -361,17 +365,21 @@ fn validate_server_settings(path: &Path, raw: &RawServer) -> Result<ServerSettin
     let stream_idle_timeout_seconds = raw
         .stream_idle_timeout_seconds
         .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS);
+    let graceful_shutdown_timeout_seconds = raw
+        .graceful_shutdown_timeout_seconds
+        .unwrap_or(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS);
     if [
         request_timeout_seconds,
         registry_request_timeout_seconds,
         stream_idle_timeout_seconds,
+        graceful_shutdown_timeout_seconds,
     ]
     .iter()
     .any(|seconds| !(1..=MAX_TIMEOUT_SECONDS).contains(seconds))
     {
         return Err(invalid_config(
             path,
-            "server request and stream timeouts must be between 1 and 3600 seconds",
+            "server request, stream, and graceful-shutdown timeouts must be between 1 and 3600 seconds",
         ));
     }
 
@@ -396,6 +404,7 @@ fn validate_server_settings(path: &Path, raw: &RawServer) -> Result<ServerSettin
         request_timeout: Duration::from_secs(request_timeout_seconds),
         registry_request_timeout: Duration::from_secs(registry_request_timeout_seconds),
         stream_idle_timeout: Duration::from_secs(stream_idle_timeout_seconds),
+        graceful_shutdown_timeout: Duration::from_secs(graceful_shutdown_timeout_seconds),
         max_autoindex_spool_bytes,
         max_autoindex_spool_total_bytes,
     })
@@ -670,6 +679,10 @@ mod tests {
             Duration::from_secs(30)
         );
         assert_eq!(default.server.stream_idle_timeout, Duration::from_secs(30));
+        assert_eq!(
+            default.server.graceful_shutdown_timeout,
+            Duration::from_secs(30)
+        );
         assert_eq!(default.server.max_autoindex_spool_bytes, 16 * 1024 * 1024);
         assert_eq!(
             default.server.max_autoindex_spool_total_bytes,
@@ -679,7 +692,7 @@ mod tests {
         let custom = Config::parse(
             Path::new("settings.toml"),
             &config(
-                "max_concurrent_requests = 2\nrequest_timeout_seconds = 11\nregistry_request_timeout_seconds = 7\nstream_idle_timeout_seconds = 5\nmax_autoindex_spool_bytes = 4096\nmax_autoindex_spool_total_bytes = 8192",
+                "max_concurrent_requests = 2\nrequest_timeout_seconds = 11\nregistry_request_timeout_seconds = 7\nstream_idle_timeout_seconds = 5\ngraceful_shutdown_timeout_seconds = 6\nmax_autoindex_spool_bytes = 4096\nmax_autoindex_spool_total_bytes = 8192",
             ),
         )
         .unwrap();
@@ -690,6 +703,10 @@ mod tests {
             Duration::from_secs(7)
         );
         assert_eq!(custom.server.stream_idle_timeout, Duration::from_secs(5));
+        assert_eq!(
+            custom.server.graceful_shutdown_timeout,
+            Duration::from_secs(6)
+        );
         assert_eq!(custom.server.max_autoindex_spool_bytes, 4096);
         assert_eq!(custom.server.max_autoindex_spool_total_bytes, 8192);
     }
@@ -702,6 +719,8 @@ mod tests {
             "request_timeout_seconds = 0",
             "registry_request_timeout_seconds = 3601",
             "stream_idle_timeout_seconds = 0",
+            "graceful_shutdown_timeout_seconds = 0",
+            "graceful_shutdown_timeout_seconds = 3601",
             "max_autoindex_spool_bytes = 0",
             "max_autoindex_spool_total_bytes = 4096\nmax_autoindex_spool_bytes = 8192",
         ] {

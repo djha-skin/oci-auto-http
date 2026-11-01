@@ -3,7 +3,7 @@ mod file;
 
 use std::{
     fs::File,
-    future::Future,
+    future::{Future, IntoFuture},
     io::{self, Read},
     path::Path,
     pin::Pin,
@@ -30,7 +30,7 @@ use oci_auto_http::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
 };
 use tokio_rustls::rustls::{
     ServerConfig,
@@ -123,16 +123,30 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
 
     if let Some(acceptor) = tls_acceptor {
         info!(%address, mounts = state.config.mounts.len(), "HTTPS listener started");
-        axum::serve(HttpsListener::new(listener, acceptor), app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(AppError::Serve)?;
+        let (shutdown_started, shutdown_notified) = oneshot::channel();
+        let server = axum::serve(HttpsListener::new(listener, acceptor), app)
+            .with_graceful_shutdown(shutdown_signal(shutdown_started))
+            .into_future();
+        serve_until_shutdown(
+            server,
+            shutdown_notified,
+            state.config.server.graceful_shutdown_timeout,
+        )
+        .await
+        .map_err(AppError::Serve)?;
     } else {
         info!(%address, mounts = state.config.mounts.len(), "HTTP listener started");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(AppError::Serve)?;
+        let (shutdown_started, shutdown_notified) = oneshot::channel();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(shutdown_started))
+            .into_future();
+        serve_until_shutdown(
+            server,
+            shutdown_notified,
+            state.config.server.graceful_shutdown_timeout,
+        )
+        .await
+        .map_err(AppError::Serve)?;
     }
     info!(%address, "HTTP listener stopped");
     Ok(())
@@ -154,6 +168,9 @@ fn apply_server_overrides(config: &mut Config, args: &ServeArgs) -> Result<(), A
     }
     if let Some(value) = args.stream_idle_timeout_seconds {
         config.server.stream_idle_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = args.graceful_shutdown_timeout_seconds {
+        config.server.graceful_shutdown_timeout = Duration::from_secs(value);
     }
     if let Some(value) = args.max_autoindex_spool_bytes {
         config.server.max_autoindex_spool_bytes = value;
@@ -723,7 +740,31 @@ fn read_ca_certificate(path: &Path) -> Result<Vec<u8>, AppError> {
     Ok(certificate)
 }
 
-async fn shutdown_signal() {
+async fn serve_until_shutdown<F>(
+    server: F,
+    shutdown_started: oneshot::Receiver<()>,
+    grace_period: Duration,
+) -> io::Result<()>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        started = shutdown_started => match started {
+            Ok(()) => match tokio::time::timeout(grace_period, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(grace_period_seconds = grace_period.as_secs(), "graceful shutdown timed out; canceling active requests");
+                    Ok(())
+                }
+            },
+            Err(_) => (&mut server).await,
+        }
+    }
+}
+
+async fn shutdown_signal(notify_started: oneshot::Sender<()>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -755,7 +796,8 @@ async fn shutdown_signal() {
         warn!(%error, "could not receive Ctrl-C signal");
     }
 
-    info!("shutdown signal received");
+    info!("shutdown signal received; draining in-flight requests");
+    let _ = notify_started.send(());
 }
 
 #[cfg(test)]

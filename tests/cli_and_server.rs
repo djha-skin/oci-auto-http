@@ -134,6 +134,7 @@ fn help_exposes_stable_command_groups_and_crud_verbs() {
         "--request-timeout-seconds",
         "--registry-request-timeout-seconds",
         "--stream-idle-timeout-seconds",
+        "--graceful-shutdown-timeout-seconds",
         "--max-autoindex-spool-bytes",
         "--max-autoindex-spool-total-bytes",
     ] {
@@ -235,6 +236,19 @@ fn invalid_arguments_and_mount_usage_fail_actionably() {
         .unwrap();
     assert_eq!(invalid_limit.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&invalid_limit.stderr).contains("invalid value"));
+
+    let invalid_shutdown_timeout = Command::new(binary())
+        .args([
+            "serve",
+            "--config",
+            "config.example.toml",
+            "--graceful-shutdown-timeout-seconds",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_shutdown_timeout.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid_shutdown_timeout.stderr).contains("invalid value"));
 
     let invalid_spool_budget = Command::new(binary())
         .args([
