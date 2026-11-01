@@ -24,6 +24,13 @@ jobs:
       - run: target/release/oci-auto-http --help
       - run: target/release/oci-auto-http mount --config deploy/config.container.example.toml list
 
+  container-smoke:
+    name: Restricted container health smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/smoke-container.sh
+
   linux-targets:
     name: Linux ${{ matrix.target }} build and smoke test
     runs-on: ubuntu-latest

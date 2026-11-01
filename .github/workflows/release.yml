@@ -51,6 +51,25 @@ jobs:
           cp -R src "$stage/src"
           tar -C "$stage" -czf "dist/$archive" .
           (cd dist && sha256sum "$archive" > "$archive.sha256")
+      - name: Verify packaged archive and binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          (cd dist && sha256sum --check "$(basename "$archive").sha256")
+          extract="$RUNNER_TEMP/archive-smoke"
+          mkdir -p "$extract"
+          tar -xzf "$archive" -C "$extract"
+          test -x "$extract/oci-auto-http"
+          case "${{ matrix.target }}" in
+            x86_64-*) expected='x86-64' ;;
+            aarch64-*) expected='aarch64' ;;
+            armv7-*) expected='ARM' ;;
+          esac
+          file "$extract/oci-auto-http" | grep -qi "$expected"
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            "$extract/oci-auto-http" --help >/dev/null
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}

@@ -1074,6 +1074,149 @@ repository = "team/empty"
 }
 
 #[tokio::test]
+async fn serve_routes_documented_package_layouts_from_an_authenticated_registry() {
+    let registry = TestRegistry::new(true);
+    let ca = fs::read(&registry.certificate).unwrap();
+    let authorization = HeaderValue::from_static(BASIC_AUTH);
+    let package_files = [
+        (
+            "team/wheels",
+            "example-1.0-py3-none-any.whl",
+            &b"test wheel bytes"[..],
+        ),
+        (
+            "team/rpm",
+            "el9/x86_64/repodata/repomd.xml",
+            &b"<repomd/>"[..],
+        ),
+        (
+            "team/rpm",
+            "el9/x86_64/repodata/Packages.xml.gz",
+            &b"test rpm metadata"[..],
+        ),
+        (
+            "team/debian",
+            "dists/stable/InRelease",
+            &b"-----BEGIN PGP SIGNED MESSAGE-----\n"[..],
+        ),
+        (
+            "team/debian",
+            "pool/main/e/example/example_1.0_all.deb",
+            &b"test deb bytes"[..],
+        ),
+    ];
+    for (repository, path, content) in package_files {
+        let mut mount = registry.mount.clone();
+        mount.repository = repository.to_owned();
+        let client = RegistryClient::new(
+            mount,
+            ClientPolicy::default().with_root_certificate_pem(&ca),
+        )
+        .unwrap();
+        let tree = TreeStore::new(client).unwrap();
+        tree.write_file(
+            &StoragePath::parse_relative(path).unwrap(),
+            Bytes::copy_from_slice(content),
+            false,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+    }
+
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("package-mounts.toml");
+    for (name, prefix, repository) in [
+        ("wheels", "/wheels", "team/wheels"),
+        ("rpm", "/rpm", "team/rpm"),
+        ("debian", "/debian", "team/debian"),
+    ] {
+        let output = Command::new(cli_binary())
+            .args(["mount", "--config"])
+            .arg(&config_path)
+            .args(["create", name, "--prefix", prefix, "--registry"])
+            .arg(&registry.base_url)
+            .args(["--repository", repository])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mount CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let listener = registry.certificate.parent().unwrap();
+    let client = https_test_client(&registry.certificate);
+    let address = unused_http_address();
+    let mut server = spawn_https_http_server(
+        &config_path,
+        &registry.certificate,
+        &listener.join("localhost.crt"),
+        &listener.join("localhost.key"),
+        address,
+    );
+    wait_for_https_http_server(&mut server.child, address, &client).await;
+
+    let unauthorized = client
+        .get(format!(
+            "https://{address}/wheels/example-1.0-py3-none-any.whl"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        unauthorized
+            .headers()
+            .contains_key(reqwest::header::WWW_AUTHENTICATE)
+    );
+    let wheel_listing = client
+        .get(format!("https://{address}/wheels/"))
+        .basic_auth(TEST_PASSWORD, Some(TEST_PASSWORD))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wheel_listing.status(), reqwest::StatusCode::OK);
+    let wheel_listing = wheel_listing.text().await.unwrap();
+    assert!(
+        wheel_listing.contains("href=\"/wheels/example-1.0-py3-none-any.whl\""),
+        "pip --find-links listing omitted the wheel link: {wheel_listing}"
+    );
+
+    for (path, expected) in [
+        (
+            "/wheels/example-1.0-py3-none-any.whl",
+            &b"test wheel bytes"[..],
+        ),
+        ("/rpm/el9/x86_64/repodata/repomd.xml", &b"<repomd/>"[..]),
+        (
+            "/rpm/el9/x86_64/repodata/Packages.xml.gz",
+            &b"test rpm metadata"[..],
+        ),
+        (
+            "/debian/dists/stable/InRelease",
+            &b"-----BEGIN PGP SIGNED MESSAGE-----\n"[..],
+        ),
+        (
+            "/debian/pool/main/e/example/example_1.0_all.deb",
+            &b"test deb bytes"[..],
+        ),
+    ] {
+        let response = client
+            .get(format!("https://{address}{path}"))
+            .basic_auth(TEST_PASSWORD, Some(TEST_PASSWORD))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), expected, "{path}");
+    }
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains(BASIC_AUTH));
+}
+
+#[tokio::test]
 async fn serve_relays_credentials_and_challenges_only_over_tls_to_the_selected_registry() {
     let primary = TestRegistry::new(true);
     let secondary = TestRegistry::new(true);

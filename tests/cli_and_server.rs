@@ -759,6 +759,35 @@ async fn serve_rejects_request_bodies_and_oversized_headers() {
     assert!(!stderr.contains("x-padding"));
 }
 
+#[test]
+fn documented_container_config_is_accepted_by_the_mount_cli_without_registry_access() {
+    let config = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("deploy")
+        .join("config.container.example.toml");
+    let output = Command::new(binary())
+        .args(["mount", "--config"])
+        .arg(config)
+        .args(["list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "container example config was rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mounts: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0]["name"], "wheels");
+    assert_eq!(mounts[0]["prefix"], "/wheels");
+    assert_eq!(mounts[1]["name"], "apt");
+    assert_eq!(mounts[1]["prefix"], "/debian");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("password")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn valid_multiple_mounts_load_without_local_content_state() {
