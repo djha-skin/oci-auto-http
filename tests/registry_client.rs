@@ -2374,21 +2374,20 @@ async fn serve_streams_concurrent_files_with_bounded_rss() {
     })
     .await
     .unwrap();
-    let mut latency_millis = latencies
-        .iter()
-        .map(Duration::as_millis)
-        .collect::<Vec<_>>();
-    latency_millis.sort_unstable();
-    let p50_ms = latency_millis[latency_millis.len() / 2];
-    let p95_ms = latency_millis[(latency_millis.len() * 95).div_ceil(100) - 1];
-    const SMALL_FILE_P95_TARGET_MS: u128 = 1_000;
+    let mut latencies = latencies;
+    latencies.sort_unstable();
+    let p50_ms = latencies[latencies.len() / 2].as_millis();
+    let p95 = latencies[(latencies.len() * 95).div_ceil(100) - 1];
+    let p95_ms = p95.as_millis();
+    const SMALL_FILE_P95_TARGET: Duration = Duration::from_secs(1);
     assert!(
-        p95_ms <= SMALL_FILE_P95_TARGET_MS,
-        "small-file p95 latency was {p95_ms} ms; target is {SMALL_FILE_P95_TARGET_MS} ms under {resource_profile}"
+        p95 <= SMALL_FILE_P95_TARGET,
+        "small-file p95 latency was {p95:?}; target is {SMALL_FILE_P95_TARGET:?} under {resource_profile}"
     );
     println!(
-        "latency-measurement scenario=small-file profile={resource_profile} requests={} object_bytes=1024 p50_ms={p50_ms} p95_ms={p95_ms} p95_target_ms={SMALL_FILE_P95_TARGET_MS}",
-        latency_millis.len()
+        "latency-measurement scenario=small-file profile={resource_profile} requests={} object_bytes=1024 p50_ms={p50_ms} p95_ms={p95_ms} p95_target_ms={}",
+        latencies.len(),
+        SMALL_FILE_P95_TARGET.as_millis()
     );
     stop_http_server(&mut server);
 }
