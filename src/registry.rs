@@ -824,7 +824,7 @@ impl RegistryClient {
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| RegistryError::new(ErrorKind::InvalidResponse))?;
-            if raw_url_reference_has_userinfo(location) {
+            if raw_url_reference_is_unsafe(location) {
                 return Err(RegistryError::new(ErrorKind::RedirectDenied));
             }
             url = url
@@ -1162,14 +1162,17 @@ fn response_location(response: &Response, base: &Url) -> Result<Url, RegistryErr
         .ok_or_else(|| RegistryError::new(ErrorKind::InvalidResponse))?
         .to_str()
         .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))?;
-    if raw_url_reference_has_userinfo(location) {
+    if raw_url_reference_is_unsafe(location) {
         return Err(RegistryError::new(ErrorKind::RedirectDenied));
     }
     base.join(location)
         .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))
 }
 
-fn raw_url_reference_has_userinfo(value: &str) -> bool {
+fn raw_url_reference_is_unsafe(value: &str) -> bool {
+    if value.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return true;
+    }
     let authority_and_path = value
         .split_once("://")
         .map(|(_, remainder)| remainder)
@@ -1694,22 +1697,24 @@ mod tests {
     }
 
     #[test]
-    fn raw_url_references_reject_empty_and_nonempty_userinfo_authorities() {
+    fn raw_url_references_reject_userinfo_and_raw_control_bytes() {
         for value in [
             "https://@registry.example/path",
             "https://user@registry.example/path",
             "https:@registry.example/path",
             "https:/@registry.example/path",
             "//@cdn.example/object",
+            "https:\t//@cdn.example/object",
+            "https://cdn.example/has raw space",
         ] {
-            assert!(raw_url_reference_has_userinfo(value), "{value}");
+            assert!(raw_url_reference_is_unsafe(value), "{value}");
         }
         for value in [
             "uploads/session@opaque",
             "https://registry.example/path@opaque",
             "https://registry.example/?return=@opaque",
         ] {
-            assert!(!raw_url_reference_has_userinfo(value), "{value}");
+            assert!(!raw_url_reference_is_unsafe(value), "{value}");
         }
     }
 
