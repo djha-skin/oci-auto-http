@@ -10,6 +10,14 @@ description = "Serve OCI-backed byte trees over HTTP"
 name = "oci-auto-http"
 path = "src/main.rs"
 
+[[test]]
+name = "registry_client"
+path = "tests/registry_client.rs"
+required-features = ["registry-tests"]
+
+[features]
+registry-tests = []
+
 [dependencies]
 axum = "0.8.9"
 clap = { version = "4.6.6", features = ["derive"] }

@@ -40,4 +40,13 @@ Run `oci-auto-http <command> --help` for command-specific usage. Invalid command
 
 ## Behavior tests
 
-Run `cargo test --locked` to exercise the compiled CLI and a real loopback HTTP listener; the tests need only the Rust toolchain and loopback sockets, not an OCI registry or external service. On Unix, the listener test also verifies graceful SIGTERM shutdown.
+Run `cargo test --locked --offline` for the compiled CLI and real loopback HTTP listener tests. They need only the Rust toolchain and loopback sockets. On Unix, the listener test verifies graceful SIGTERM shutdown.
+
+The OCI Distribution integration suite is an explicit opt-in because it creates local Docker containers and transfers a 128 MiB blob to test an interrupted read. Pull the image once, then run:
+
+```sh
+docker pull registry:2
+cargo test --locked --offline --features registry-tests --test registry_client -- --nocapture
+```
+
+The opt-in suite requires a running Docker daemon, OpenSSL, and curl. It starts isolated TLS-enabled `registry:2` containers on random loopback ports, uses a generated test CA and temporary registry storage/auth file, and removes containers/files on completion. It exercises actual manifest/blob publish, independent curl reads, digest/size verification, pagination-compatible tag listing, large tag-list reads, Basic challenge relay, 404, timeout, deletion, and an interrupted blob transfer; pure unit tests separately validate same-origin `Link` pagination handling; it makes no calls to an external registry after the image is present locally.
