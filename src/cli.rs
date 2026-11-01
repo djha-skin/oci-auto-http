@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -43,9 +43,12 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// TCP address on which to listen.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    pub listen: SocketAddr,
+    /// Version-1 TOML configuration file.
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+    /// Override the listen address configured in the file.
+    #[arg(long)]
+    pub listen: Option<SocketAddr>,
 }
 
 #[derive(Debug, Subcommand)]

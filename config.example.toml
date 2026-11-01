@@ -1,0 +1,12 @@
+version = 1
+
+[server]
+listen = "127.0.0.1:8080"
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "https://registry.example:5000"
+repository = "team/packages"
+root_tag = "oci-auto-http-tree-v1"
+redirect_allowlist = ["cdn.example:443"]

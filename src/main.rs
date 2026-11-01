@@ -2,6 +2,7 @@
 
 mod cli;
 mod commands;
+mod config;
 mod error;
 mod logging;
 mod server;

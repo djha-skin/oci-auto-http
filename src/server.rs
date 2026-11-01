@@ -2,14 +2,19 @@ use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::{cli::ServeArgs, error::AppError};
+use crate::{cli::ServeArgs, config::Config, error::AppError};
 
 pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
+    let mut config = Config::load(&args.config)?;
+    if let Some(listen) = args.listen {
+        config.listen = listen;
+    }
+
     let listener =
-        TcpListener::bind(args.listen)
+        TcpListener::bind(config.listen)
             .await
             .map_err(|source| AppError::BindListener {
-                address: args.listen,
+                address: config.listen,
                 source,
             })?;
     let address = listener.local_addr().map_err(AppError::Serve)?;
@@ -18,7 +23,7 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
         .route("/healthz", get(health).head(health))
         .fallback(not_ready);
 
-    info!(%address, "HTTP listener started; mount handling is not configured in this foundation build");
+    info!(%address, mounts = config.mounts.len(), "HTTP listener started; mounted storage serving is not implemented in this build");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -34,7 +39,7 @@ async fn health() -> StatusCode {
 async fn not_ready() -> impl IntoResponse {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        "mounted storage is not configured in this build\n",
+        "mounted storage serving is not implemented in this build\n",
     )
 }
 

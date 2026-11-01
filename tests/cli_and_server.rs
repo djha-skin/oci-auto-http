@@ -1,4 +1,13 @@
-use std::{net::TcpListener, path::PathBuf, process::Command};
+use std::{
+    fs,
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(unix)]
 use std::{
@@ -8,6 +17,66 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+fn config_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new() -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "oci-auto-http-test-{}-{unique}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self { path }
+    }
+
+    fn write_config(&self, contents: &str) -> PathBuf {
+        let path = self.path.join("config.toml");
+        fs::write(&path, contents).unwrap();
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn valid_two_mount_config() -> String {
+    r#"
+version = 1
+
+[server]
+listen = "127.0.0.1:9999"
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "https://reg-a.example"
+repository = "team/packages"
+
+[[mounts]]
+name = "mirror"
+prefix = "/mirror"
+registry = "https://reg-b.example:5443"
+repository = "team/mirror"
+root_tag = "mirror-v2"
+redirect_allowlist = ["cdn.example:443"]
+"#
+    .to_owned()
+}
 
 fn binary() -> PathBuf {
     ["CARGO_BIN_EXE_oci-auto-http", "CARGO_BIN_EXE_oci_auto_http"]
@@ -122,9 +191,107 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
 }
 
 #[test]
+fn malformed_ambiguous_and_unsafe_configs_fail_before_listening() {
+    let temp = TempDir::new();
+    let base = valid_two_mount_config();
+    let invalid = [
+        ("malformed TOML", "version = [".to_owned()),
+        (
+            "unsupported version",
+            base.replace("version = 1", "version = 2"),
+        ),
+        (
+            "overlapping mounts",
+            base.replace("prefix = \"/mirror\"", "prefix = \"/packages/child\""),
+        ),
+        (
+            "encoded separator",
+            base.replace("prefix = \"/mirror\"", "prefix = \"/safe/%2Fsecret\""),
+        ),
+        (
+            "insecure registry",
+            base.replace("https://reg-b.example:5443", "http://reg-b.example:5443"),
+        ),
+        (
+            "registry userinfo",
+            base.replace(
+                "https://reg-b.example:5443",
+                "https://user:supersecret@reg-b.example:5443",
+            ),
+        ),
+        (
+            "unknown option",
+            base.replace(
+                "repository = \"team/mirror\"",
+                "repository = \"team/mirror\"\nunsupported_option = \"do-not-leak\"",
+            ),
+        ),
+    ];
+
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    for (case, contents) in invalid {
+        let config = temp.write_config(&contents);
+        let output = Command::new(binary())
+            .args(["serve", "--config"])
+            .arg(config)
+            .args(["--listen", &address.to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{case}: {:?}", output.stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid configuration"), "{case}: {stderr}");
+        assert!(
+            !stderr.contains("supersecret"),
+            "{case} leaked credentials: {stderr}"
+        );
+        assert!(
+            !stderr.contains("do-not-leak"),
+            "{case} echoed config data: {stderr}"
+        );
+        assert!(
+            !stderr.contains("could not bind HTTP listener"),
+            "{case} attempted bind before validation: {stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn valid_multiple_mounts_load_without_local_content_state() {
+    let temp = TempDir::new();
+    let config = temp.write_config(&valid_two_mount_config());
+    let address = unused_loopback_address();
+    let mut server = spawn_server_with_config(address, &config, Some(&temp.path));
+
+    let health = request_until_ready(&mut server.child, address, "GET", "/healthz");
+    assert!(health.starts_with("HTTP/1.1 204"), "{health}");
+
+    let stderr = stop_server(&mut server);
+    let startup = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| {
+            record["fields"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP listener started")
+        })
+        .expect("valid multi-mount config starts the listener");
+    assert_eq!(startup["fields"]["mounts"], 2);
+    let entries: Vec<_> = fs::read_dir(&temp.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("config.toml")]);
+}
+
+#[test]
 fn invalid_listen_address_and_bind_failure_are_actionable() {
     let invalid = Command::new(binary())
-        .args(["serve", "--listen", "not-a-socket-address"])
+        .args(["serve", "--config"])
+        .arg(config_file())
+        .args(["--listen", "not-a-socket-address"])
         .output()
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
@@ -133,7 +300,9 @@ fn invalid_listen_address_and_bind_failure_are_actionable() {
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = occupied.local_addr().unwrap();
     let output = Command::new(binary())
-        .args(["serve", "--listen", &address.to_string()])
+        .args(["serve", "--config"])
+        .arg(config_file())
+        .args(["--listen", &address.to_string()])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -158,8 +327,66 @@ fn serve_runs_a_real_listener_and_shuts_down_on_sigterm() {
 
     let fallback = request_until_ready(&mut server.child, address, "GET", "/");
     assert!(fallback.starts_with("HTTP/1.1 503"), "{fallback}");
-    assert!(fallback.contains("mounted storage is not configured"));
+    assert!(fallback.contains("mounted storage serving is not implemented"));
 
+    let stderr = stop_server(&mut server);
+    assert!(
+        stderr.contains("HTTP listener stopped"),
+        "server stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+struct RunningServer {
+    child: Child,
+    stopped: bool,
+}
+
+#[cfg(unix)]
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_server(address: SocketAddr) -> RunningServer {
+    spawn_server_with_config(address, &config_file(), None)
+}
+
+#[cfg(unix)]
+fn spawn_server_with_config(
+    address: SocketAddr,
+    config: &Path,
+    working_directory: Option<&Path>,
+) -> RunningServer {
+    let mut command = Command::new(binary());
+    command
+        .args(["--log-format", "json", "serve", "--config"])
+        .arg(config)
+        .args(["--listen", &address.to_string()])
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(directory) = working_directory {
+        command
+            .current_dir(directory)
+            .env("HOME", directory)
+            .env("XDG_CACHE_HOME", directory);
+    }
+    let child = command.spawn().unwrap();
+    RunningServer {
+        child,
+        stopped: false,
+    }
+}
+
+#[cfg(unix)]
+fn stop_server(server: &mut RunningServer) -> String {
     let signal = Command::new("kill")
         .args(["-TERM", &server.child.id().to_string()])
         .status()
@@ -189,41 +416,7 @@ fn serve_runs_a_real_listener_and_shuts_down_on_sigterm() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(status.success());
-    assert!(
-        stderr.contains("HTTP listener stopped"),
-        "server stderr: {stderr}"
-    );
-}
-
-#[cfg(unix)]
-struct RunningServer {
-    child: Child,
-    stopped: bool,
-}
-
-#[cfg(unix)]
-impl Drop for RunningServer {
-    fn drop(&mut self) {
-        if !self.stopped {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-#[cfg(unix)]
-fn spawn_server(address: SocketAddr) -> RunningServer {
-    let child = Command::new(binary())
-        .args(["serve", "--listen", &address.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    RunningServer {
-        child,
-        stopped: false,
-    }
+    stderr
 }
 
 #[cfg(unix)]
