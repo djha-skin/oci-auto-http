@@ -770,7 +770,16 @@ repository = "team/empty"
         "/packages/nested/"
     );
     let directory_page = http_request(address, "GET", "/packages/nested/", &[]).unwrap();
-    assert_eq!(directory_page.status, 501);
+    assert_eq!(directory_page.status, 200);
+    assert_eq!(
+        directory_page.headers.get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let html = String::from_utf8_lossy(&directory_page.body);
+    assert!(html.contains("Index of /packages/nested/"));
+    assert!(html.contains("href=\"/packages/\">../</a>"));
+    assert!(html.contains("href=\"/packages/nested/canary.bin\">canary.bin</a>"));
+    assert!(!html.contains("<script"));
     let file_with_slash =
         http_request(address, "GET", "/packages/nested/canary.bin/", &[]).unwrap();
     assert_eq!(file_with_slash.status, 404);

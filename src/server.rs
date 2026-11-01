@@ -141,8 +141,22 @@ async fn route_request_inner(
     let store = &state.stores[mount_index];
 
     if resolved.trailing_slash {
-        return match store.list_page(&resolved.storage_path, 1, None, None).await {
-            Ok(_) => directory_not_implemented(method),
+        if !file::accepts_html(&headers) {
+            return error_response(
+                StatusCode::NOT_ACCEPTABLE,
+                "directory listing is not acceptable\n",
+            );
+        }
+        return match store
+            .list_page(
+                &resolved.storage_path,
+                file::AUTO_INDEX_PAGE_SIZE,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(page) => file::directory_response(store.clone(), &resolved, page, method),
             Err(error) => tree_error_response(error),
         };
     }
@@ -199,21 +213,6 @@ fn permanent_redirect(path: &ResolvedPath<'_>) -> Response {
         .header(header::CONTENT_LENGTH, "0")
         .body(Body::empty())
         .expect("canonical location is a valid header")
-}
-
-fn directory_not_implemented(method: Method) -> Response {
-    let body = if method == Method::HEAD {
-        Body::empty()
-    } else {
-        Body::from("directory listings are not implemented yet\n")
-    };
-    Response::builder()
-        .status(StatusCode::NOT_IMPLEMENTED)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .header(header::VARY, "Accept, Authorization")
-        .body(body)
-        .expect("static directory response headers are valid")
 }
 
 fn tree_error_response(error: TreeError) -> Response {

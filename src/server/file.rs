@@ -1,21 +1,23 @@
-use std::io;
+use std::{collections::VecDeque, io};
 
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::Response,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use oci_auto_http::{
+    config::{Mount, ResolvedPath},
     registry::{Descriptor, Digest},
-    tree::{StoragePath, TreeError, TreeFile},
+    tree::{DirectoryEntry, DirectoryPage, EntryKind, StoragePath, TreeError, TreeFile, TreeStore},
 };
 use tracing::warn;
 
 use super::{error_response, tree_error_response};
 
 const MAX_CONDITIONAL_HEADER_BYTES: usize = 8192;
+pub(super) const AUTO_INDEX_PAGE_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteRange {
@@ -101,6 +103,278 @@ pub(super) async fn get_response(
             Body::from_stream(withhold_range(file.body, range)),
         ),
     }
+}
+
+pub(super) fn accepts_html(headers: &HeaderMap) -> bool {
+    let values = headers.get_all(header::ACCEPT);
+    if values.iter().next().is_none() {
+        return true;
+    }
+
+    let mut exact_html = None;
+    let mut text_wildcard = None;
+    let mut any_wildcard = None;
+    for value in values.iter() {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        for media_range in value.split(',') {
+            let mut parts = media_range.split(';');
+            let media_type = parts.next().unwrap_or_default().trim();
+            let mut quality = 1.0_f32;
+            for parameter in parts {
+                if let Some((name, value)) = parameter.trim().split_once('=')
+                    && name.trim().eq_ignore_ascii_case("q")
+                {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|quality| quality.is_finite() && (0.0..=1.0).contains(quality))
+                        .unwrap_or(0.0);
+                }
+            }
+            let target = if media_type.eq_ignore_ascii_case("text/html") {
+                &mut exact_html
+            } else if media_type.eq_ignore_ascii_case("text/*") {
+                &mut text_wildcard
+            } else if media_type == "*/*" {
+                &mut any_wildcard
+            } else {
+                continue;
+            };
+            *target = Some(target.map_or(quality, |previous: f32| previous.max(quality)));
+        }
+    }
+    exact_html.or(text_wildcard).or(any_wildcard).unwrap_or(0.0) > 0.0
+}
+
+pub(super) fn directory_response(
+    store: TreeStore,
+    path: &ResolvedPath<'_>,
+    first_page: DirectoryPage,
+    method: Method,
+) -> Response {
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let root_digest = first_page.root_digest.clone();
+        let phase_finished = first_page.next_cursor.is_none();
+        let cursor = first_page.next_cursor;
+        let pending = first_page
+            .entries
+            .into_iter()
+            .filter(|entry| entry.kind == EntryKind::Directory)
+            .collect();
+        let state = AutoIndexStreamState {
+            store,
+            mount: path.mount.clone(),
+            directory: path.storage_path.clone(),
+            root_digest,
+            cursor,
+            pending,
+            phase: AutoIndexPhase::Directories,
+            phase_finished,
+            prefix: Some(autoindex_prefix(path)),
+            footer_pending: true,
+        };
+        Body::from_stream(autoindex_stream(state))
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::VARY, "Accept, Authorization")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        )
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(body)
+        .expect("static autoindex response headers are valid")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoIndexPhase {
+    Directories,
+    Files,
+    Done,
+}
+
+struct AutoIndexStreamState {
+    store: TreeStore,
+    mount: Mount,
+    directory: StoragePath,
+    root_digest: Digest,
+    cursor: Option<String>,
+    pending: VecDeque<DirectoryEntry>,
+    phase: AutoIndexPhase,
+    phase_finished: bool,
+    prefix: Option<Bytes>,
+    footer_pending: bool,
+}
+
+fn autoindex_prefix(path: &ResolvedPath<'_>) -> Bytes {
+    let canonical_path = escape_html(&path.canonical_url_path(true));
+    let mut prefix = format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Index of {canonical_path}</title></head><body>
+<h1>Index of {canonical_path}</h1>
+<ul>
+"#
+    );
+    if !path.storage_path.is_root() {
+        let parent = ResolvedPath {
+            mount: path.mount,
+            storage_path: path
+                .storage_path
+                .parent()
+                .expect("non-root path has a parent"),
+            trailing_slash: true,
+        };
+        prefix.push_str(&format!(
+            r#"<li><a href="{}">../</a></li>
+"#,
+            escape_html(&parent.canonical_url_path(true))
+        ));
+    }
+    Bytes::from(prefix)
+}
+
+fn render_directory_entry(
+    mount: &Mount,
+    directory: &StoragePath,
+    entry: DirectoryEntry,
+) -> Result<Bytes, TreeError> {
+    let is_directory = entry.kind == EntryKind::Directory;
+    let child = directory.child(entry.name.clone())?;
+    let path = ResolvedPath {
+        mount,
+        storage_path: child,
+        trailing_slash: is_directory,
+    };
+    let href = escape_html(&path.canonical_url_path(is_directory));
+    let suffix = if is_directory { "/" } else { "" };
+    let label = escape_html(&format!("{}{suffix}", entry.name));
+    Ok(Bytes::from(format!(
+        r#"<li><a href="{href}">{label}</a></li>
+"#
+    )))
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn autoindex_stream(
+    state: AutoIndexStreamState,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    stream::unfold(state, |mut state| async move {
+        if let Some(prefix) = state.prefix.take() {
+            return Some((Ok(prefix), state));
+        }
+        loop {
+            if let Some(entry) = state.pending.pop_front() {
+                return match render_directory_entry(&state.mount, &state.directory, entry) {
+                    Ok(chunk) => Some((Ok(chunk), state)),
+                    Err(_) => {
+                        state.phase = AutoIndexPhase::Done;
+                        state.pending.clear();
+                        state.footer_pending = false;
+                        Some((
+                            Err(io::Error::other("directory metadata failed validation")),
+                            state,
+                        ))
+                    }
+                };
+            }
+            if state.phase == AutoIndexPhase::Done {
+                if state.footer_pending {
+                    state.footer_pending = false;
+                    return Some((
+                        Ok(Bytes::from_static(
+                            br#"</ul>
+</body></html>
+"#,
+                        )),
+                        state,
+                    ));
+                }
+                return None;
+            }
+            if state.phase_finished {
+                match state.phase {
+                    AutoIndexPhase::Directories => {
+                        state.phase = AutoIndexPhase::Files;
+                        state.cursor = None;
+                        state.phase_finished = false;
+                    }
+                    AutoIndexPhase::Files => {
+                        state.phase = AutoIndexPhase::Done;
+                        state.footer_pending = true;
+                    }
+                    AutoIndexPhase::Done => unreachable!(),
+                }
+                continue;
+            }
+
+            let page = state
+                .store
+                .list_page_pinned(
+                    &state.directory,
+                    AUTO_INDEX_PAGE_SIZE,
+                    &state.root_digest,
+                    state.cursor.as_deref(),
+                    None,
+                )
+                .await;
+            let page = match page {
+                Ok(page) if page.root_digest == state.root_digest => page,
+                Ok(_) => {
+                    state.phase = AutoIndexPhase::Done;
+                    state.pending.clear();
+                    state.footer_pending = false;
+                    return Some((
+                        Err(io::Error::other(
+                            "directory snapshot changed during listing",
+                        )),
+                        state,
+                    ));
+                }
+                Err(_) => {
+                    warn!("OCI directory listing failed after response headers");
+                    state.phase = AutoIndexPhase::Done;
+                    state.pending.clear();
+                    state.footer_pending = false;
+                    return Some((Err(io::Error::other("OCI directory listing failed")), state));
+                }
+            };
+            let wanted_kind = match state.phase {
+                AutoIndexPhase::Directories => EntryKind::Directory,
+                AutoIndexPhase::Files => EntryKind::File,
+                AutoIndexPhase::Done => unreachable!(),
+            };
+            state.pending.extend(
+                page.entries
+                    .into_iter()
+                    .filter(|entry| entry.kind == wanted_kind),
+            );
+            state.cursor = page.next_cursor;
+            state.phase_finished = state.cursor.is_none();
+        }
+    })
 }
 
 pub(super) fn head_response(
@@ -597,6 +871,7 @@ mod tests {
     use futures_util::TryStreamExt;
 
     use super::*;
+    use oci_auto_http::config::Config;
 
     #[test]
     fn maps_mime_types_by_case_insensitive_final_extension() {
@@ -705,6 +980,61 @@ mod tests {
             HeaderValue::from_str(&format!("{etag},")).unwrap(),
         );
         assert_eq!(select_range(&headers, 10, etag), RangeSelection::Full);
+    }
+
+    #[test]
+    fn directory_accept_negotiation_honors_specific_exclusion() {
+        let mut headers = HeaderMap::new();
+        assert!(accepts_html(&headers));
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        assert!(accepts_html(&headers));
+        headers.insert(header::ACCEPT, HeaderValue::from_static("text/*;q=0.5"));
+        assert!(accepts_html(&headers));
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        assert!(!accepts_html(&headers));
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html;q=0, */*;q=1"),
+        );
+        assert!(!accepts_html(&headers));
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/*;q=0, */*;q=1"),
+        );
+        assert!(!accepts_html(&headers));
+    }
+
+    #[test]
+    fn autoindex_escapes_names_and_canonicalizes_links() {
+        let config = Config::parse(
+            std::path::Path::new("autoindex.toml"),
+            r#"version = 1
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "https://registry.example"
+repository = "team/packages"
+"#,
+        )
+        .unwrap();
+        let mount = &config.mounts[0];
+        let directory = StoragePath::parse_relative("dir").unwrap();
+        let entry = DirectoryEntry {
+            name: r#"<script>&".txt"#.to_owned(),
+            kind: EntryKind::File,
+            digest: Digest::from_bytes(b"content"),
+            size: 7,
+        };
+        let html = String::from_utf8(
+            render_directory_entry(mount, &directory, entry)
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(r#"href="/packages/dir/%3Cscript%3E%26%22.txt""#));
+        assert!(html.contains("&lt;script&gt;&amp;&quot;.txt"));
+        assert!(!html.contains("<script>"));
     }
 
     #[tokio::test]

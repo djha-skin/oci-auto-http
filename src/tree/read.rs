@@ -91,6 +91,32 @@ impl TreeStore {
         continuation: Option<&str>,
         authorization: Option<&HeaderValue>,
     ) -> Result<DirectoryPage, TreeError> {
+        self.list_page_with_root(path, limit, continuation, None, authorization)
+            .await
+    }
+
+    /// List a page from a caller-pinned root digest instead of resolving the
+    /// mutable root tag. This lets a multi-pass reader preserve one snapshot.
+    pub async fn list_page_pinned(
+        &self,
+        path: &StoragePath,
+        limit: usize,
+        root_digest: &Digest,
+        continuation: Option<&str>,
+        authorization: Option<&HeaderValue>,
+    ) -> Result<DirectoryPage, TreeError> {
+        self.list_page_with_root(path, limit, continuation, Some(root_digest), authorization)
+            .await
+    }
+
+    async fn list_page_with_root(
+        &self,
+        path: &StoragePath,
+        limit: usize,
+        continuation: Option<&str>,
+        pinned_root: Option<&Digest>,
+        authorization: Option<&HeaderValue>,
+    ) -> Result<DirectoryPage, TreeError> {
         if limit == 0 || limit > super::MAX_LISTING_PAGE_SIZE {
             return Err(TreeError::InvalidPageSize);
         }
@@ -102,22 +128,27 @@ impl TreeStore {
             }
             let digest =
                 Digest::parse(&payload.root_digest).map_err(|_| TreeError::InvalidCursor)?;
+            if pinned_root.is_some_and(|expected| expected != &digest) {
+                return Err(TreeError::InvalidCursor);
+            }
             let root = self.root_by_digest(&digest, true, authorization).await?;
             (root, Some(payload))
+        } else if let Some(pinned_root) = pinned_root {
+            (
+                self.root_by_digest(pinned_root, true, authorization)
+                    .await?,
+                None,
+            )
         } else {
             (self.resolve_root(authorization).await?, None)
         };
+        let stale_snapshot = cursor_state.is_some() || pinned_root.is_some();
 
         let directory = if path.is_root() {
             root.clone()
         } else {
             let descriptor = self
-                .lookup_entry(
-                    &root,
-                    path.components(),
-                    cursor_state.is_some(),
-                    authorization,
-                )
+                .lookup_entry(&root, path.components(), stale_snapshot, authorization)
                 .await?;
             if descriptor.media_type != OCI_IMAGE_INDEX {
                 return Err(TreeError::NotDirectory);
@@ -137,7 +168,7 @@ impl TreeStore {
         let mut listing = ListingCollector {
             after,
             limit: limit.saturating_add(1),
-            stale_cursor: cursor_state.is_some(),
+            stale_cursor: stale_snapshot,
             authorization,
             visited: HashSet::new(),
             entries: Vec::with_capacity(limit.saturating_add(1)),
@@ -148,7 +179,7 @@ impl TreeStore {
         let has_more = entries.len() > limit;
         entries.truncate(limit);
         for entry in &entries {
-            self.validate_listed_entry(entry, cursor_state.is_some(), authorization)
+            self.validate_listed_entry(entry, stale_snapshot, authorization)
                 .await?;
         }
         let next_cursor = if has_more {
