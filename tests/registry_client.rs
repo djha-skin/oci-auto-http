@@ -970,6 +970,237 @@ repository = "team/empty"
 }
 
 #[tokio::test]
+async fn serve_relays_credentials_and_challenges_only_over_tls_to_the_selected_registry() {
+    let primary = TestRegistry::new(true);
+    let secondary = TestRegistry::new(true);
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("authenticated.toml");
+    let primary_mount = Command::new(cli_binary())
+        .args(["mount", "--config"])
+        .arg(&config_path)
+        .args([
+            "create",
+            "primary",
+            "--prefix",
+            "/primary",
+            "--registry",
+            &primary.base_url,
+            "--repository",
+            "team/releases",
+        ])
+        .output()
+        .unwrap();
+    assert_cli_success(primary_mount);
+    let secondary_mount = Command::new(cli_binary())
+        .args(["mount", "--config"])
+        .arg(&config_path)
+        .args([
+            "create",
+            "secondary",
+            "--prefix",
+            "/secondary",
+            "--registry",
+            &secondary.base_url,
+            "--repository",
+            "team/releases",
+        ])
+        .output()
+        .unwrap();
+    assert_cli_success(secondary_mount);
+
+    let authorization = HeaderValue::from_static(BASIC_AUTH);
+    for (registry, contents) in [
+        (&primary, b"primary private bytes".as_slice()),
+        (&secondary, b"secondary private bytes".as_slice()),
+    ] {
+        let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+        tree.write_file(
+            &StoragePath::parse_relative("private.txt").unwrap(),
+            Bytes::copy_from_slice(contents),
+            false,
+            Some(&authorization),
+        )
+        .await
+        .unwrap();
+    }
+
+    let registry_ca_bundle = scratch.path.join("registry-ca-bundle.pem");
+    let mut registry_ca_bytes = fs::read(&primary.certificate).unwrap();
+    registry_ca_bytes.extend_from_slice(&fs::read(&secondary.certificate).unwrap());
+    fs::write(&registry_ca_bundle, registry_ca_bytes).unwrap();
+    let primary_certificate_dir = primary.certificate.parent().unwrap();
+    let listener_certificate = primary_certificate_dir.join("localhost.crt");
+    let listener_key = primary_certificate_dir.join("localhost.key");
+    let tls_client = https_test_client(&primary.certificate);
+
+    let tls_address = unused_http_address();
+    let mut tls_server = spawn_https_http_server(
+        &config_path,
+        &registry_ca_bundle,
+        &listener_certificate,
+        &listener_key,
+        tls_address,
+    );
+    wait_for_https_http_server(&mut tls_server.child, tls_address, &tls_client).await;
+
+    let primary_url = format!("https://{tls_address}/primary/private.txt");
+    let secondary_url = format!("https://{tls_address}/secondary/private.txt");
+    let primary_before = primary.request_count("team/releases");
+    let secondary_before = secondary.request_count("team/releases");
+
+    let unauthenticated = tls_client.get(&primary_url).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let challenges: Vec<_> = unauthenticated
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(challenges.len(), 1);
+    assert!(challenges[0].starts_with("Basic realm="));
+    assert_eq!(
+        unauthenticated.bytes().await.unwrap().as_ref(),
+        b"unauthorized\n"
+    );
+    wait_for_registry_requests(&primary, "team/releases", primary_before + 1);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(secondary.request_count("team/releases"), secondary_before);
+
+    let wrong_credential = tls_client
+        .get(&primary_url)
+        .header(reqwest::header::AUTHORIZATION, "Basic d3Jvbmc6cGFzcw==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_credential.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let rejected_challenges: Vec<_> = wrong_credential
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(rejected_challenges, challenges);
+    assert_eq!(
+        wrong_credential.bytes().await.unwrap().as_ref(),
+        b"unauthorized\n"
+    );
+    wait_for_registry_requests(&primary, "team/releases", primary_before + 2);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(secondary.request_count("team/releases"), secondary_before);
+
+    let accepted = tls_client
+        .get(&primary_url)
+        .header(reqwest::header::AUTHORIZATION, BASIC_AUTH)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        accepted.bytes().await.unwrap().as_ref(),
+        b"primary private bytes"
+    );
+    wait_for_registry_requests(&primary, "team/releases", primary_before + 3);
+    let primary_after = primary.request_count("team/releases");
+    assert!(primary_after > primary_before);
+    assert_eq!(secondary.request_count("team/releases"), secondary_before);
+
+    let accepted_secondary = tls_client
+        .get(&secondary_url)
+        .header(reqwest::header::AUTHORIZATION, BASIC_AUTH)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted_secondary.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        accepted_secondary.bytes().await.unwrap().as_ref(),
+        b"secondary private bytes"
+    );
+    wait_for_registry_requests(&secondary, "team/releases", secondary_before + 1);
+    let secondary_after = secondary.request_count("team/releases");
+    assert!(secondary_after > secondary_before);
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        primary.request_count("team/releases"),
+        primary_after,
+        "a request selected for the secondary mount must not reach the primary registry"
+    );
+
+    let mut duplicate_authorization = reqwest::header::HeaderMap::new();
+    duplicate_authorization.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static(BASIC_AUTH),
+    );
+    duplicate_authorization.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Basic d3Jvbmc6cGFzcw=="),
+    );
+    let before_duplicate = primary.request_count("team/releases");
+    let duplicate = tls_client
+        .get(&primary_url)
+        .headers(duplicate_authorization)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        !duplicate
+            .headers()
+            .contains_key(reqwest::header::WWW_AUTHENTICATE)
+    );
+    let _ = duplicate.bytes().await.unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(primary.request_count("team/releases"), before_duplicate);
+
+    let outside = tls_client
+        .get(format!("https://{tls_address}/unmounted/private.txt"))
+        .header(reqwest::header::AUTHORIZATION, BASIC_AUTH)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outside.status(), reqwest::StatusCode::NOT_FOUND);
+    let _ = outside.bytes().await.unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(primary.request_count("team/releases"), before_duplicate);
+    assert_eq!(secondary.request_count("team/releases"), secondary_after);
+
+    let tls_stderr = stop_http_server(&mut tls_server);
+    assert!(!tls_stderr.contains(BASIC_AUTH));
+    assert!(!tls_stderr.contains("d3Jvbmc6cGFzcw=="));
+
+    let plain_address = unused_http_address();
+    let mut plain_server = spawn_http_server(&config_path, &registry_ca_bundle, plain_address);
+    wait_for_http_server(&mut plain_server.child, plain_address);
+    let primary_before_plain = primary.request_count("team/releases");
+    let secondary_before_plain = secondary.request_count("team/releases");
+    let cleartext_credential = http_request(
+        plain_address,
+        "GET",
+        "/primary/private.txt",
+        &[("Authorization", BASIC_AUTH)],
+    )
+    .unwrap();
+    assert_eq!(cleartext_credential.status, 403);
+    assert_eq!(primary.request_count("team/releases"), primary_before_plain);
+    assert_eq!(
+        secondary.request_count("team/releases"),
+        secondary_before_plain
+    );
+
+    let cleartext_challenge =
+        http_request(plain_address, "GET", "/primary/private.txt", &[]).unwrap();
+    assert_eq!(cleartext_challenge.status, 403);
+    assert!(!cleartext_challenge.headers.contains_key("www-authenticate"));
+    wait_for_registry_requests(&primary, "team/releases", primary_before_plain + 1);
+    assert_eq!(
+        secondary.request_count("team/releases"),
+        secondary_before_plain
+    );
+    let plain_stderr = stop_http_server(&mut plain_server);
+    assert!(!plain_stderr.contains(BASIC_AUTH));
+    assert!(!plain_stderr.contains("d3Jvbmc6cGFzcw=="));
+}
+
+#[tokio::test]
 async fn mount_cli_changes_take_effect_after_restarting_the_server() {
     let registry = TestRegistry::new(false);
     let scratch = TempDir::new();
@@ -2411,6 +2642,74 @@ fn spawn_http_server(config: &Path, certificate: &Path, address: SocketAddr) -> 
     RunningHttpServer {
         child,
         stopped: false,
+    }
+}
+
+fn spawn_https_http_server(
+    config: &Path,
+    registry_ca: &Path,
+    listener_certificate: &Path,
+    listener_key: &Path,
+    address: SocketAddr,
+) -> RunningHttpServer {
+    let child = Command::new(cli_binary())
+        .args(["--log-format", "json", "serve", "--config"])
+        .arg(config)
+        .args(["--ca-cert"])
+        .arg(registry_ca)
+        .args(["--tls-cert"])
+        .arg(listener_certificate)
+        .args(["--tls-key"])
+        .arg(listener_key)
+        .args(["--listen", &address.to_string()])
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    RunningHttpServer {
+        child,
+        stopped: false,
+    }
+}
+
+fn https_test_client(certificate: &Path) -> reqwest::Client {
+    let root = reqwest::Certificate::from_pem(&fs::read(certificate).unwrap()).unwrap();
+    reqwest::Client::builder()
+        .add_root_certificate(root)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+async fn wait_for_https_http_server(
+    child: &mut Child,
+    address: SocketAddr,
+    client: &reqwest::Client,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            panic!("HTTPS server exited before readiness: {status}; stderr: {stderr}");
+        }
+        if client
+            .get(format!("https://{address}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status() == reqwest::StatusCode::NO_CONTENT)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTPS server did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
