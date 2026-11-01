@@ -367,16 +367,60 @@ fn serve_runs_a_real_listener_and_shuts_down_on_sigterm() {
     );
     assert!(credential.starts_with("HTTP/1.1 403"), "{credential}");
     assert!(!credential.contains("do-not-log-this"), "{credential}");
+    let health_credential = request_until_ready_with_headers(
+        &mut server.child,
+        address,
+        "GET",
+        "/healthz",
+        &[("Authorization", "Bearer health-secret")],
+    );
+    assert!(
+        health_credential.starts_with("HTTP/1.1 403"),
+        "{health_credential}"
+    );
+    let unsupported_credential = request_until_ready_with_headers(
+        &mut server.child,
+        address,
+        "POST",
+        "/healthz",
+        &[("Authorization", "Bearer method-secret")],
+    );
+    assert!(
+        unsupported_credential.starts_with("HTTP/1.1 403"),
+        "{unsupported_credential}"
+    );
+    let duplicate_credentials = request_until_ready_with_headers(
+        &mut server.child,
+        address,
+        "GET",
+        "/healthz",
+        &[
+            ("Authorization", "Bearer first-secret"),
+            ("Authorization", "Bearer second-secret"),
+        ],
+    );
+    assert!(
+        duplicate_credentials.starts_with("HTTP/1.1 400"),
+        "{duplicate_credentials}"
+    );
 
     let stderr = stop_server(&mut server);
     assert!(
         stderr.contains("HTTP listener stopped"),
         "server stderr: {stderr}"
     );
-    assert!(
-        !stderr.contains("do-not-log-this"),
-        "server logs leaked an Authorization value: {stderr}"
-    );
+    for secret in [
+        "do-not-log-this",
+        "health-secret",
+        "method-secret",
+        "first-secret",
+        "second-secret",
+    ] {
+        assert!(
+            !stderr.contains(secret),
+            "server logs leaked Authorization value {secret}: {stderr}"
+        );
+    }
 }
 
 #[cfg(unix)]

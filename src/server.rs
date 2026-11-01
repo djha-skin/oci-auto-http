@@ -9,7 +9,8 @@ use axum::{
     Router,
     body::Body,
     extract::{OriginalUri, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
+    middleware::{self, Next},
     response::Response,
     routing::get,
 };
@@ -66,6 +67,7 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     let app = Router::new()
         .route("/healthz", get(health).head(health))
         .fallback(route_request)
+        .layer(middleware::from_fn(reject_cleartext_authorization))
         .with_state(state.clone());
 
     info!(%address, mounts = state.config.mounts.len(), "HTTP listener started");
@@ -77,6 +79,19 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+async fn reject_cleartext_authorization(request: Request<Body>, next: Next) -> Response {
+    let mut authorization = request.headers().get_all(header::AUTHORIZATION).iter();
+    if authorization.next().is_some() {
+        if authorization.next().is_some() {
+            return error_response(StatusCode::BAD_REQUEST, "invalid request\n");
+        }
+        // This listener currently accepts cleartext HTTP only. Never forward a
+        // credential or relay its challenge across an untrusted cleartext hop.
+        return error_response(StatusCode::FORBIDDEN, "forbidden\n");
+    }
+    next.run(request).await
+}
+
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -85,20 +100,9 @@ async fn route_request(
     State(state): State<Arc<ServeState>>,
     method: Method,
     OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
 ) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return method_not_allowed();
-    }
-
-    let mut authorization = headers.get_all(header::AUTHORIZATION).iter();
-    if authorization.next().is_some() {
-        if authorization.next().is_some() {
-            return error_response(StatusCode::BAD_REQUEST, "invalid request\n");
-        }
-        // This listener currently accepts cleartext HTTP only. Never forward a
-        // credential or relay its challenge across an untrusted cleartext hop.
-        return error_response(StatusCode::FORBIDDEN, "forbidden\n");
     }
 
     let resolved = match state.config.resolve_served_path(uri.path()) {
@@ -254,7 +258,9 @@ fn tree_error_response(error: TreeError) -> Response {
         }
         TreeError::Registry(error) => match error.kind {
             ErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "gateway timeout\n"),
-            ErrorKind::RateLimited => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n"),
+            ErrorKind::RateLimited | ErrorKind::Transport | ErrorKind::Server => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+            }
             ErrorKind::Forbidden => (StatusCode::FORBIDDEN, "forbidden\n"),
             ErrorKind::Unauthorized => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
             _ => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
