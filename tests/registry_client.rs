@@ -861,6 +861,89 @@ repository = "team/empty"
 }
 
 #[tokio::test]
+async fn mount_cli_changes_take_effect_after_restarting_the_server() {
+    let registry = TestRegistry::new(false);
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("serve-restart.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "{}"
+repository = "team/packages"
+"#,
+            registry.base_url
+        ),
+    )
+    .unwrap();
+
+    let initial_address = unused_http_address();
+    let mut initial_server =
+        spawn_http_server(&config_path, &registry.certificate, initial_address);
+    wait_for_http_server(&mut initial_server.child, initial_address);
+
+    let created = Command::new(cli_binary())
+        .args(["mount", "--config"])
+        .arg(&config_path)
+        .args([
+            "create",
+            "mirror",
+            "--prefix",
+            "/mirror",
+            "--registry",
+            &registry.base_url,
+            "--repository",
+            "team/mirror",
+        ])
+        .output()
+        .unwrap();
+    assert_cli_success(created);
+
+    let config = Config::load(&config_path).unwrap();
+    let mirror = config
+        .mounts
+        .iter()
+        .find(|mount| mount.name == "mirror")
+        .unwrap()
+        .clone();
+    let certificate = fs::read(&registry.certificate).unwrap();
+    let client = RegistryClient::new(
+        mirror,
+        ClientPolicy::default().with_root_certificate_pem(&certificate),
+    )
+    .unwrap();
+    let tree = TreeStore::new(client).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("welcome.txt").unwrap(),
+        Bytes::from_static(b"mount changes need a server restart"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let mirror_requests = registry.request_count("team/mirror");
+    let before_restart = http_request(initial_address, "GET", "/mirror/welcome.txt", &[]).unwrap();
+    assert_eq!(before_restart.status, 404);
+    assert_eq!(registry.request_count("team/mirror"), mirror_requests);
+    stop_http_server(&mut initial_server);
+
+    let restarted_address = unused_http_address();
+    let mut restarted_server =
+        spawn_http_server(&config_path, &registry.certificate, restarted_address);
+    wait_for_http_server(&mut restarted_server.child, restarted_address);
+    let after_restart = http_request(restarted_address, "GET", "/mirror/welcome.txt", &[]).unwrap();
+    assert_eq!(after_restart.status, 200);
+    assert_eq!(after_restart.body, b"mount changes need a server restart");
+    stop_http_server(&mut restarted_server);
+}
+
+#[tokio::test]
 async fn serve_renders_safe_sorted_paginated_autoindexes_for_real_tree_data() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();

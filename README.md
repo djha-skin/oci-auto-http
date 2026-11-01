@@ -27,7 +27,7 @@ Configuration is version-1 TOML. `version` is required; `[server].listen` defaul
 
 ## Mount commands
 
-Mount commands read and validate the selected TOML file, then print JSON to standard output. `create` initializes a missing config file with version 1; `list` prints a JSON array, `show` prints one mount, and successful mutations print the affected mount or deleted name. Configuration edits preserve unrelated TOML comments/formatting, validate the complete result before writing, and atomically replace a regular non-symlink file. CLI mutations serialize through a persistent hidden lock file beside the config; do not remove it while commands may be running, and coordinate edits from external tools. They never contact a registry. The final mount cannot be deleted, and a mount's name is immutable.
+Mount commands read and validate the selected TOML file, then print JSON to standard output. `create` initializes a missing config file with version 1; `list` prints a JSON array, `show` prints one mount, and successful mutations print the affected mount or deleted name. Configuration edits preserve unrelated TOML comments/formatting, validate the complete result before writing, and atomically replace a regular non-symlink file. CLI mutations serialize through a persistent hidden lock file beside the config; do not remove it while commands may be running, and coordinate edits from external tools. A running `serve` process keeps the configuration loaded at startup, so restart it for mount changes to take effect. Mount commands never contact a registry. The final mount cannot be deleted, and a mount's name is immutable.
 
 ```sh
 cargo run -- mount --config ./config.toml create packages \
