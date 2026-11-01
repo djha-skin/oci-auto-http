@@ -48,11 +48,11 @@ Run `oci-auto-http <command> --help` for command-specific usage. Invalid command
 
 Run `cargo test --locked --offline` for the compiled CLI and real loopback HTTP listener tests. They need only the Rust toolchain and loopback sockets. On Unix, the listener test verifies graceful SIGTERM shutdown.
 
-The OCI Distribution integration suite is an explicit opt-in because it creates local Docker containers and transfers a 128 MiB blob to test an interrupted read. Pull the image once, then run:
+The OCI Distribution and tree-storage integration suite is an explicit opt-in because it creates local Docker containers, injects commit-boundary connection drops through a local TLS proxy, and transfers a 128 MiB blob to test an interrupted read. Pull the image once, then run:
 
 ```sh
 docker pull registry:2
 cargo test --locked --offline --features registry-tests --test registry_client -- --nocapture
 ```
 
-The opt-in suite requires a running Docker daemon, OpenSSL, and curl. It starts isolated TLS-enabled `registry:2` containers on random loopback ports, uses a generated test CA and temporary registry storage/auth file, and removes containers/files on completion. It exercises actual manifest/blob publish, independent curl reads, digest/size verification, pagination-compatible tag listing, large tag-list reads, Basic challenge relay, 404, timeout, deletion, and an interrupted blob transfer; pure unit tests separately validate same-origin `Link` pagination handling; it makes no calls to an external registry after the image is present locally.
+The opt-in suite requires a running Docker daemon, the local `registry:2` image, OpenSSL, and curl. It starts isolated TLS-enabled registries on random loopback ports, uses a generated test CA and temporary registry storage/auth file, and removes containers/files on completion. In addition to Distribution client coverage, it exercises nested tree writes and byte-exact reads across fresh client/store construction, independent curl inspection of root and file OCI objects, 129-entry branch-page bounds and ordering, concurrent writers, cursor snapshot pinning, source-stream failure before publication, and TLS-proxy connection drops both before and after the root-tag commit. The fault proxy forwards to a real local registry and only injects the specified dropped connection; happy paths are never mocked. Pure unit tests separately validate same-origin `Link` pagination; no calls are made to an external registry once the image is present locally.
