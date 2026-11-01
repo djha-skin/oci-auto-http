@@ -2288,6 +2288,72 @@ async fn serve_maps_a_late_autoindex_page_challenge_before_committing_success_he
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn serve_streams_concurrent_files_with_bounded_rss() {
+    let registry = TestRegistry::new(false);
+    let file_size = 16 * 1024 * 1024_u64;
+    let contents = vec![0x5a; file_size as usize];
+    let digest = Digest::from_bytes(&contents);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    for path in ["first.bin", "second.bin"] {
+        tree.write_file(
+            &StoragePath::parse_relative(path).unwrap(),
+            Bytes::copy_from_slice(&contents),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    drop(tree);
+
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("concurrent-streams.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[server]\nmax_concurrent_requests = 2\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            registry.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+    let pid = server.child.id();
+    let baseline_rss = process_rss_bytes(pid);
+
+    let started = Instant::now();
+    let first =
+        tokio::task::spawn_blocking(move || stream_http_response(address, "/files/first.bin", pid));
+    let second = tokio::task::spawn_blocking(move || {
+        stream_http_response(address, "/files/second.bin", pid)
+    });
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    let wall_time = started.elapsed();
+    for response in [&first, &second] {
+        assert_eq!(response.status, 200);
+        assert_eq!(response.bytes_read, file_size);
+        assert_eq!(response.digest, digest.to_string());
+    }
+    let peak_rss = first.peak_rss_bytes.max(second.peak_rss_bytes);
+    let peak_rss_delta = peak_rss.saturating_sub(baseline_rss);
+    let aggregate_size = file_size * 2;
+    assert!(
+        peak_rss_delta < aggregate_size / 2,
+        "server RSS grew by {peak_rss_delta} bytes for {aggregate_size} concurrent response bytes"
+    );
+    println!(
+        "resource-measurement scenario=concurrent-slow-reader concurrency=2 reader_delay_ms_per_64k=1 object_bytes_each={file_size} wall_elapsed_ms={} aggregate_throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
+        wall_time.as_millis(),
+        aggregate_size as f64 / (1024.0 * 1024.0) / wall_time.as_secs_f64(),
+        aggregate_size / 2
+    );
+    stop_http_server(&mut server);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn serve_streams_large_files_with_bounded_rss_and_cancels_after_disconnect() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -2347,11 +2413,16 @@ repository = "team/releases"
         download.headers.get("content-length").unwrap(),
         &total_size.to_string()
     );
+    let peak_rss_delta = download.peak_rss_bytes.saturating_sub(baseline_rss);
     assert!(
-        download.peak_rss_bytes.saturating_sub(baseline_rss) < total_size / 2,
-        "server RSS grew by {} bytes while serving a {} byte blob",
-        download.peak_rss_bytes.saturating_sub(baseline_rss),
-        total_size
+        peak_rss_delta < total_size / 2,
+        "server RSS grew by {peak_rss_delta} bytes while serving a {total_size} byte blob"
+    );
+    println!(
+        "resource-measurement scenario=single-slow-reader reader_delay_ms_per_64k=1 object_bytes={total_size} elapsed_ms={} throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
+        download.elapsed.as_millis(),
+        total_size as f64 / (1024.0 * 1024.0) / download.elapsed.as_secs_f64(),
+        total_size / 2
     );
     stop_http_server(&mut direct_server);
 
@@ -2572,8 +2643,103 @@ async fn serve_bounds_inflight_streams_and_releases_request_permits() {
 }
 
 #[tokio::test]
-async fn serve_maps_a_stopped_registry_to_service_unavailable() {
+async fn serve_drains_an_inflight_response_after_sigterm() {
+    let (response, stderr, total_size) =
+        shutdown_during_blob_stream(1024 * 1024, Duration::from_millis(10), 4).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body.len() as u64, total_size);
+    assert_eq!(response.body, vec![0x5a; total_size as usize]);
+    assert!(stderr.contains("draining in-flight requests"));
+    assert!(!stderr.contains("graceful shutdown timed out"));
+}
+
+#[tokio::test]
+async fn serve_cancels_an_inflight_response_when_sigterm_drain_deadline_expires() {
+    let (response, stderr, total_size) =
+        shutdown_during_blob_stream(4 * 1024 * 1024, Duration::from_millis(100), 1).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.headers.get("content-length").unwrap(),
+        &total_size.to_string()
+    );
+    assert!(response.body.len() < total_size as usize);
+    assert!(stderr.contains("graceful shutdown timed out; canceling active requests"));
+}
+
+async fn shutdown_during_blob_stream(
+    total_size: u64,
+    proxy_chunk_delay: Duration,
+    grace_period_seconds: u64,
+) -> (HttpResponse, String, u64) {
     let registry = TestRegistry::new(false);
+    let contents = vec![0x5a; total_size as usize];
+    let digest = Digest::from_bytes(&contents);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("shutdown.bin").unwrap(),
+        Bytes::from(contents),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let proxy = FaultProxy::slowly_tracking_blob(&registry, &digest, proxy_chunk_delay).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("shutdown-drain.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[server]\nrequest_timeout_seconds = 60\nregistry_request_timeout_seconds = 30\nstream_idle_timeout_seconds = 30\ngraceful_shutdown_timeout_seconds = {grace_period_seconds}\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let request = tokio::task::spawn_blocking(move || {
+        http_request(address, "GET", "/files/shutdown.bin", &[])
+    });
+    wait_for_proxy_blob_bytes(&proxy, 1).await;
+    let bytes_at_signal = proxy.tracked_blob_bytes();
+    assert!(
+        bytes_at_signal > 0 && bytes_at_signal < total_size,
+        "shutdown test did not catch an active blob stream ({bytes_at_signal}/{total_size} bytes forwarded)"
+    );
+    let signal = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        signal.success(),
+        "could not send SIGTERM to HTTP test server"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let late_request =
+        tokio::task::spawn_blocking(move || http_request(address, "GET", "/healthz", &[]))
+            .await
+            .unwrap();
+    assert!(
+        late_request.is_err() || late_request.as_ref().unwrap().status != 204,
+        "server accepted a new request after SIGTERM began shutdown"
+    );
+
+    let shutdown_deadline = Duration::from_secs(grace_period_seconds + 5);
+    let stderr = wait_http_server_exit(&mut server, shutdown_deadline).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("HTTP request did not finish after server shutdown")
+        .unwrap()
+        .unwrap();
+    (response, stderr, total_size)
+}
+
+#[tokio::test]
+async fn serve_recovers_after_a_registry_outage_without_restarting() {
+    let registry = TestRegistry::new_with_port(false, Some(unused_registry_host_port()));
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
     tree.write_file(
         &StoragePath::parse_relative("available.txt").unwrap(),
@@ -2615,6 +2781,35 @@ repository = "team/releases"
     assert_eq!(response.status, 503);
     assert_eq!(response.body, b"service unavailable\n");
     assert!(!String::from_utf8_lossy(&response.body).contains("127.0.0.1"));
+
+    let started = Command::new("docker")
+        .args(["start", &registry.container])
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "could not restart test registry");
+    wait_until_ready(
+        &registry.container,
+        &registry.base_url,
+        &registry.certificate,
+        false,
+    );
+    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let recovered = http_request(address, "GET", "/files/available.txt", &[]).unwrap();
+        if recovered.status == 200 {
+            assert_eq!(recovered.body, b"stored before registry stopped");
+            break;
+        }
+        assert_eq!(
+            recovered.status, 503,
+            "unexpected response during registry recovery"
+        );
+        assert!(
+            Instant::now() < recovery_deadline,
+            "service did not recover after the registry restarted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     stop_http_server(&mut server);
 }
 
@@ -3429,6 +3624,7 @@ struct StreamedHttpResponse {
     bytes_read: u64,
     digest: String,
     peak_rss_bytes: u64,
+    elapsed: Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -3452,6 +3648,7 @@ fn stream_http_response(
     target: &str,
     pid: u32,
 ) -> io::Result<StreamedHttpResponse> {
+    let started = Instant::now();
     let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     write!(
@@ -3487,6 +3684,7 @@ fn stream_http_response(
         bytes_read: received,
         digest: format!("sha256:{:x}", hasher.finalize()),
         peak_rss_bytes,
+        elapsed: started.elapsed(),
     })
 }
 
@@ -3651,6 +3849,31 @@ fn wait_for_http_server(child: &mut Child, address: SocketAddr) {
     }
 }
 
+async fn wait_http_server_exit(server: &mut RunningHttpServer, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTP server did not exit within {timeout:?} after SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    server.stopped = true;
+    let mut stderr = String::new();
+    server
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "HTTP test server exited unsuccessfully");
+    stderr
+}
+
 fn stop_http_server(server: &mut RunningHttpServer) -> String {
     let signal = Command::new("kill")
         .args(["-TERM", &server.child.id().to_string()])
@@ -3672,6 +3895,16 @@ fn stop_http_server(server: &mut RunningHttpServer) -> String {
         .unwrap();
     assert!(status.success(), "HTTP test server exited unsuccessfully");
     stderr
+}
+
+fn unused_registry_host_port() -> u16 {
+    for port in 20_000..32_000 {
+        if let Ok(listener) = StdTcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
+        }
+    }
+    panic!("could not find an unused fixed port for restartable test registry");
 }
 
 fn unused_http_address() -> SocketAddr {
@@ -3720,6 +3953,10 @@ struct TestRegistry {
 
 impl TestRegistry {
     fn new(authenticated: bool) -> Self {
+        Self::new_with_port(authenticated, None)
+    }
+
+    fn new_with_port(authenticated: bool, host_port: Option<u16>) -> Self {
         assert_command("docker", &["info"], "Docker daemon must be running");
         assert_command(
             "docker",
@@ -3742,6 +3979,10 @@ impl TestRegistry {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let container = format!("oci-auto-http-registry-{}-{sequence}", std::process::id());
         let certificate_volume = format!("{}:/certs:ro,z", certificates.display());
+        let published_port = host_port.map_or_else(
+            || "127.0.0.1::5000".to_owned(),
+            |port| format!("127.0.0.1:{port}:5000"),
+        );
         let mut command = Command::new("docker");
         command.args([
             "run",
@@ -3749,7 +3990,7 @@ impl TestRegistry {
             "--name",
             &container,
             "--publish",
-            "127.0.0.1::5000",
+            &published_port,
             "--volume",
             &certificate_volume,
             "--env",
