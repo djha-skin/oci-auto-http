@@ -27,7 +27,7 @@ use oci_auto_http::{
         Bytes, ClientPolicy, Digest, ErrorKind, HeaderValue, ManifestReference, OCI_EMPTY_CONFIG,
         OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST, RegistryClient,
     },
-    tree::{EntryKind, StoragePath, TreeError, TreeStore},
+    tree::{DirectoryEntry, EntryKind, StoragePath, TreeError, TreeStore},
 };
 #[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
@@ -2626,6 +2626,110 @@ async fn tree_rejects_branch_chains_beyond_the_documented_depth_limit() {
 }
 
 #[tokio::test]
+async fn tree_refuses_root_promotion_that_would_deepen_an_untouched_sibling() {
+    let registry = TestRegistry::new(false);
+    let client = registry.client(ClientPolicy::default());
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("a").unwrap(),
+        Bytes::from_static(b"shared valid file manifest"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let root_leaf = client
+        .get_manifest(
+            &ManifestReference::Tag(registry.mount.root_tag.clone()),
+            &[OCI_IMAGE_INDEX],
+            None,
+        )
+        .await
+        .unwrap();
+    let leaf_json: serde_json::Value = serde_json::from_slice(&root_leaf.bytes).unwrap();
+    let shared_file_descriptor = &leaf_json["manifests"][0];
+    let shared_file_digest =
+        Digest::parse(shared_file_descriptor["digest"].as_str().unwrap()).unwrap();
+    let shared_file_size = shared_file_descriptor["size"].as_u64().unwrap();
+
+    let leaf_bytes = test_leaf_index(vec![shared_file_descriptor.clone()]);
+    let (mut deep_digest, mut deep_size) = put_test_index(&client, leaf_bytes).await;
+    for _ in 0..63 {
+        let branch = test_branch_index(vec![test_branch_descriptor(
+            &deep_digest,
+            deep_size,
+            "a",
+            "a",
+        )]);
+        (deep_digest, deep_size) = put_test_index(&client, branch).await;
+    }
+    let mut root_children = vec![test_branch_descriptor(&deep_digest, deep_size, "a", "a")];
+
+    let mut overflowing_leaf = Vec::new();
+    for index in 0..128 {
+        let name = format!("b000-{index:03}");
+        overflowing_leaf.push(test_file_descriptor(&DirectoryEntry {
+            name,
+            kind: EntryKind::File,
+            digest: shared_file_digest.clone(),
+            size: shared_file_size,
+        }));
+    }
+    let (digest, size) = put_test_index(&client, test_leaf_index(overflowing_leaf)).await;
+    root_children.push(test_branch_descriptor(
+        &digest, size, "b000-000", "b000-127",
+    ));
+
+    for index in 1..=126 {
+        let name = format!("b{index:03}");
+        let descriptor = test_file_descriptor(&DirectoryEntry {
+            name: name.clone(),
+            kind: EntryKind::File,
+            digest: shared_file_digest.clone(),
+            size: shared_file_size,
+        });
+        let (digest, size) = put_test_index(&client, test_leaf_index(vec![descriptor])).await;
+        root_children.push(test_branch_descriptor(&digest, size, &name, &name));
+    }
+    assert_eq!(root_children.len(), 128);
+
+    let root_bytes = test_branch_index(root_children);
+    let root_digest = Digest::from_bytes(&root_bytes);
+    client
+        .put_manifest(
+            &ManifestReference::Tag(registry.mount.root_tag.clone()),
+            OCI_IMAGE_INDEX,
+            Bytes::from(root_bytes),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let error = tree
+        .write_file(
+            &StoragePath::parse_relative("b000-050a").unwrap(),
+            Bytes::from_static(b"must not publish"),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TreeError::IndexDepthLimit));
+    assert_eq!(
+        client
+            .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+            .await
+            .unwrap()
+            .digest,
+        root_digest,
+        "a failed root promotion must not publish an over-depth sibling"
+    );
+}
+
+#[tokio::test]
 async fn tree_failed_content_stream_does_not_publish_a_new_root() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -2781,6 +2885,75 @@ fn parse_listing(output: Output) -> Vec<serde_json::Value> {
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_slice(line).unwrap())
         .collect()
+}
+
+fn test_leaf_index(descriptors: Vec<serde_json::Value>) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_INDEX,
+        "manifests": descriptors,
+        "annotations": {
+            "io.github.djha-skin.oci-auto-http.node-kind": "directory-leaf",
+            "io.github.djha-skin.oci-auto-http.format-version": "1"
+        }
+    }))
+    .unwrap()
+}
+
+fn test_branch_index(descriptors: Vec<serde_json::Value>) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_IMAGE_INDEX,
+        "manifests": descriptors,
+        "annotations": {
+            "io.github.djha-skin.oci-auto-http.node-kind": "directory-branch",
+            "io.github.djha-skin.oci-auto-http.format-version": "1"
+        }
+    }))
+    .unwrap()
+}
+
+fn test_file_descriptor(entry: &DirectoryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "mediaType": OCI_IMAGE_MANIFEST,
+        "digest": entry.digest.to_string(),
+        "size": entry.size,
+        "annotations": {
+            "io.github.djha-skin.oci-auto-http.entry-name": entry.name
+        }
+    })
+}
+
+fn test_branch_descriptor(
+    digest: &Digest,
+    size: u64,
+    first_name: &str,
+    last_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mediaType": OCI_IMAGE_INDEX,
+        "digest": digest.to_string(),
+        "size": size,
+        "annotations": {
+            "io.github.djha-skin.oci-auto-http.first-name": first_name,
+            "io.github.djha-skin.oci-auto-http.last-name": last_name
+        }
+    })
+}
+
+async fn put_test_index(client: &RegistryClient, bytes: Vec<u8>) -> (Digest, u64) {
+    let digest = Digest::from_bytes(&bytes);
+    let size = bytes.len() as u64;
+    client
+        .put_manifest(
+            &ManifestReference::Digest(digest.clone()),
+            OCI_IMAGE_INDEX,
+            Bytes::from(bytes),
+            None,
+        )
+        .await
+        .unwrap();
+    (digest, size)
 }
 
 async fn install_single_child_branch_chain(

@@ -1,13 +1,4 @@
-use std::{
-    collections::HashSet,
-    future::Future,
-    io,
-    pin::Pin,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{collections::HashSet, future::Future, io, pin::Pin, sync::Mutex};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -45,7 +36,6 @@ enum WriteMode {
 struct MutationContext<'a> {
     authorization: Option<&'a HeaderValue>,
     ancestors: Mutex<HashSet<Digest>>,
-    max_depth: AtomicUsize,
 }
 
 impl<'a> MutationContext<'a> {
@@ -53,12 +43,7 @@ impl<'a> MutationContext<'a> {
         Self {
             authorization,
             ancestors: Mutex::new(HashSet::new()),
-            max_depth: AtomicUsize::new(0),
         }
-    }
-
-    fn max_depth(&self) -> usize {
-        self.max_depth.load(Ordering::Relaxed)
     }
 }
 
@@ -394,9 +379,7 @@ impl TreeStore {
                 let pages = self
                     .mutate_page(current_root, name, operation, true, 0, &context)
                     .await?;
-                return self
-                    .promote_root(pages, context.max_depth(), authorization)
-                    .await;
+                return self.promote_root(pages, authorization).await;
             }
 
             let parent_name = &parent_components[0];
@@ -451,8 +434,7 @@ impl TreeStore {
                     &context,
                 )
                 .await?;
-            self.promote_root(pages, context.max_depth(), authorization)
-                .await
+            self.promote_root(pages, authorization).await
         })
     }
 
@@ -472,7 +454,6 @@ impl TreeStore {
             if depth > MAX_INDEX_DEPTH {
                 return Err(TreeError::IndexDepthLimit);
             }
-            context.max_depth.fetch_max(depth, Ordering::Relaxed);
             let digest = page.descriptor.digest()?;
             let inserted = context
                 .ancestors
@@ -623,10 +604,43 @@ impl TreeStore {
         Ok(pages)
     }
 
+    async fn max_index_page_depth(
+        &self,
+        roots: &[PageRef],
+        authorization: Option<&HeaderValue>,
+    ) -> Result<usize, TreeError> {
+        let mut max_depth = 0;
+        let mut visited = HashSet::new();
+        let mut pages = roots
+            .iter()
+            .cloned()
+            .map(|page| (page, 0_usize))
+            .collect::<Vec<_>>();
+        while let Some((page, depth)) = pages.pop() {
+            if depth > MAX_INDEX_DEPTH {
+                return Err(TreeError::IndexDepthLimit);
+            }
+            let digest = page.descriptor.digest()?;
+            if !visited.insert(digest) {
+                return Err(TreeError::IntegrityError);
+            }
+            let index = self.load_index(&page, false, authorization).await?;
+            max_depth = max_depth.max(depth);
+            if index.kind()? == IndexKind::Branch {
+                if depth == MAX_INDEX_DEPTH {
+                    return Err(TreeError::IndexDepthLimit);
+                }
+                for descriptor in index.manifests {
+                    pages.push((page_ref_from_branch_child(descriptor)?, depth + 1));
+                }
+            }
+        }
+        Ok(max_depth)
+    }
+
     async fn promote_root(
         &self,
         mut pages: Vec<PageRef>,
-        max_existing_depth: usize,
         authorization: Option<&HeaderValue>,
     ) -> Result<PageRef, TreeError> {
         if pages.is_empty() {
@@ -634,9 +648,12 @@ impl TreeStore {
                 .upload_index(&OciIndex::new(IndexKind::Leaf, Vec::new()), authorization)
                 .await;
         }
-        let mut added_depth = 0;
+        if pages.len() == 1 {
+            return Ok(pages.remove(0));
+        }
+        let mut subtree_depth = self.max_index_page_depth(&pages, authorization).await?;
         while pages.len() > 1 {
-            if max_existing_depth.saturating_add(added_depth + 1) > MAX_INDEX_DEPTH {
+            if subtree_depth >= MAX_INDEX_DEPTH {
                 return Err(TreeError::IndexDepthLimit);
             }
             let descriptors = pages
@@ -646,7 +663,7 @@ impl TreeStore {
             pages = self
                 .upload_page_group(IndexKind::Branch, descriptors, authorization)
                 .await?;
-            added_depth += 1;
+            subtree_depth += 1;
         }
         Ok(pages.remove(0))
     }
