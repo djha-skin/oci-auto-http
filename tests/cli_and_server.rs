@@ -350,13 +350,32 @@ fn serve_runs_a_real_listener_and_shuts_down_on_sigterm() {
     );
 
     let fallback = request_until_ready(&mut server.child, address, "GET", "/");
-    assert!(fallback.starts_with("HTTP/1.1 503"), "{fallback}");
-    assert!(fallback.contains("mounted storage serving is not implemented"));
+    assert!(fallback.starts_with("HTTP/1.1 404"), "{fallback}");
+    assert!(fallback.contains("not found"));
+
+    let invalid = request_until_ready(&mut server.child, address, "GET", "/packages/%2Fsecret");
+    assert!(invalid.starts_with("HTTP/1.1 400"), "{invalid}");
+    let unsupported = request_until_ready(&mut server.child, address, "POST", "/packages/file");
+    assert!(unsupported.starts_with("HTTP/1.1 405"), "{unsupported}");
+    assert!(unsupported.contains("allow: GET, HEAD"), "{unsupported}");
+    let credential = request_until_ready_with_headers(
+        &mut server.child,
+        address,
+        "GET",
+        "/packages/file",
+        &[("Authorization", "Bearer do-not-log-this")],
+    );
+    assert!(credential.starts_with("HTTP/1.1 403"), "{credential}");
+    assert!(!credential.contains("do-not-log-this"), "{credential}");
 
     let stderr = stop_server(&mut server);
     assert!(
         stderr.contains("HTTP listener stopped"),
         "server stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("do-not-log-this"),
+        "server logs leaked an Authorization value: {stderr}"
     );
 }
 
@@ -445,6 +464,17 @@ fn stop_server(server: &mut RunningServer) -> String {
 
 #[cfg(unix)]
 fn request_until_ready(child: &mut Child, address: SocketAddr, method: &str, path: &str) -> String {
+    request_until_ready_with_headers(child, address, method, path, &[])
+}
+
+#[cfg(unix)]
+fn request_until_ready_with_headers(
+    child: &mut Child,
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -458,11 +488,11 @@ fn request_until_ready(child: &mut Child, address: SocketAddr, method: &str, pat
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            write!(
-                stream,
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
+            write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\n").unwrap();
+            for (name, value) in headers {
+                write!(stream, "{name}: {value}\r\n").unwrap();
+            }
+            stream.write_all(b"Connection: close\r\n\r\n").unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             return response;

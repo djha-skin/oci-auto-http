@@ -69,7 +69,7 @@ impl AppError {
 fn tree_exit_code(error: &TreeError) -> u8 {
     match error {
         TreeError::InvalidPath | TreeError::InvalidPageSize | TreeError::InvalidCursor => 2,
-        TreeError::NotFound => 66,
+        TreeError::NotFound | TreeError::MissingRoot => 66,
         TreeError::AlreadyExists
         | TreeError::DirectoryNotEmpty
         | TreeError::IsDirectory

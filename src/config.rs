@@ -3,7 +3,10 @@ use std::{fs, net::SocketAddr, path::Path};
 use serde::Deserialize;
 use url::Url;
 
-use crate::error::AppError;
+use crate::{
+    error::AppError,
+    tree::{StoragePath, TreeError},
+};
 
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
@@ -28,6 +31,36 @@ pub struct Mount {
     pub root_tag: String,
     /// Canonical HTTPS authorities (`host:port`) permitted for blob redirects.
     pub redirect_allowlist: Vec<String>,
+}
+
+/// A validated request path matched to exactly one configured mount.
+#[derive(Debug)]
+pub struct ResolvedPath<'a> {
+    pub mount: &'a Mount,
+    pub storage_path: StoragePath,
+    pub trailing_slash: bool,
+}
+
+impl ResolvedPath<'_> {
+    /// Build a canonical escaped URL path using the configured mount prefix.
+    pub fn canonical_url_path(&self, trailing_slash: bool) -> String {
+        let mut path = if self.mount.prefix == "/" {
+            String::new()
+        } else {
+            self.mount.prefix.trim_end_matches('/').to_owned()
+        };
+        for component in self.storage_path.components() {
+            path.push('/');
+            path.push_str(&encode_component(component.as_bytes()));
+        }
+        if path.is_empty() {
+            path.push('/');
+        }
+        if trailing_slash && !path.ends_with('/') {
+            path.push('/');
+        }
+        path
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +228,79 @@ impl Config {
 
         Ok(Self { listen, mounts })
     }
+
+    /// Decode an escaped origin-form path once and select its configured mount.
+    /// A valid path outside every mount returns `Ok(None)`; malformed paths
+    /// return `InvalidPath` before any registry request can be made.
+    pub fn resolve_served_path(
+        &self,
+        escaped_path: &str,
+    ) -> Result<Option<ResolvedPath<'_>>, TreeError> {
+        let (components, trailing_slash) = decode_request_path(escaped_path)?;
+        let Some(mount) = self
+            .mounts
+            .iter()
+            .find(|mount| components.starts_with(&mount.prefix_components))
+        else {
+            return Ok(None);
+        };
+        let relative = components[mount.prefix_components.len()..].to_vec();
+        Ok(Some(ResolvedPath {
+            mount,
+            storage_path: StoragePath::from_components(relative)?,
+            trailing_slash,
+        }))
+    }
+}
+
+fn decode_request_path(path: &str) -> Result<(Vec<String>, bool), TreeError> {
+    const MAX_ESCAPED_PATH_BYTES: usize = 32 * 1024;
+    const MAX_TOTAL_COMPONENTS: usize = 256;
+    if !path.starts_with('/') || path.len() > MAX_ESCAPED_PATH_BYTES || path.contains(['?', '#']) {
+        return Err(TreeError::InvalidPath);
+    }
+
+    let trailing_slash = path.ends_with('/');
+    let raw_path = if path.len() > 1 && trailing_slash {
+        &path[1..path.len() - 1]
+    } else {
+        &path[1..]
+    };
+    if raw_path.is_empty() {
+        return Ok((Vec::new(), trailing_slash));
+    }
+
+    let mut components = Vec::new();
+    for raw_component in raw_path.split('/') {
+        if components.len() == MAX_TOTAL_COMPONENTS || raw_component.is_empty() {
+            return Err(TreeError::InvalidPath);
+        }
+        let component = decode_request_component(raw_component)?;
+        StoragePath::from_components(vec![component.clone()])?;
+        components.push(component);
+    }
+    Ok((components, trailing_slash))
+}
+
+fn decode_request_component(raw: &str) -> Result<String, TreeError> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(TreeError::InvalidPath);
+            }
+            let high = hex_value(bytes[index + 1]).ok_or(TreeError::InvalidPath)?;
+            let low = hex_value(bytes[index + 2]).ok_or(TreeError::InvalidPath)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| TreeError::InvalidPath)
 }
 
 fn invalid_config(path: &Path, reason: &str) -> AppError {
@@ -429,6 +535,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
     }
 }

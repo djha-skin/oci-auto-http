@@ -45,7 +45,7 @@ pub async fn run(args: ArtifactArgs) -> Result<(), AppError> {
                 }
                 match store.stat_file(&storage_path, None).await {
                     Ok(_) => return Err(TreeError::AlreadyExists.into()),
-                    Err(TreeError::NotFound) => {}
+                    Err(TreeError::NotFound | TreeError::MissingRoot) => {}
                     Err(error) => return Err(error.into()),
                 }
                 let input = prepare_input(input).await?;
@@ -133,71 +133,13 @@ fn resolve_served_path<'a>(
     served_path: &str,
     allow_trailing_slash: bool,
 ) -> Result<(&'a Mount, StoragePath), AppError> {
-    let components = decode_served_path(served_path, allow_trailing_slash)?;
-    let mount = config
-        .mounts
-        .iter()
-        .find(|mount| components.starts_with(&mount.prefix_components))
+    let resolved = config
+        .resolve_served_path(served_path)?
         .ok_or(AppError::NoMountForPath)?;
-    let relative = components[mount.prefix_components.len()..].to_vec();
-    Ok((mount, StoragePath::from_components(relative)?))
-}
-
-fn decode_served_path(path: &str, allow_trailing_slash: bool) -> Result<Vec<String>, AppError> {
-    if !path.starts_with('/') || path.contains(['?', '#']) {
+    if resolved.trailing_slash && !allow_trailing_slash {
         return Err(AppError::InvalidServedPath);
     }
-
-    let path = if allow_trailing_slash && path.len() > 1 && path.ends_with('/') {
-        &path[..path.len() - 1]
-    } else {
-        path
-    };
-    if path != "/" && path.ends_with('/') {
-        return Err(AppError::InvalidServedPath);
-    }
-    if path == "/" {
-        return Ok(Vec::new());
-    }
-
-    path[1..]
-        .split('/')
-        .map(decode_component)
-        .collect::<Result<Vec<_>, _>>()
-}
-
-fn decode_component(raw: &str) -> Result<String, AppError> {
-    let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err(AppError::InvalidServedPath);
-            }
-            let high = hex_value(bytes[index + 1]).ok_or(AppError::InvalidServedPath)?;
-            let low = hex_value(bytes[index + 2]).ok_or(AppError::InvalidServedPath)?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    let component = String::from_utf8(decoded).map_err(|_| AppError::InvalidServedPath)?;
-    if component.is_empty() {
-        return Err(AppError::InvalidServedPath);
-    }
-    Ok(component)
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    Ok((resolved.mount, resolved.storage_path))
 }
 
 async fn prepare_input(input: Option<PathBuf>) -> Result<PreparedInput, AppError> {

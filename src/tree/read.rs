@@ -184,7 +184,7 @@ impl TreeStore {
             .await
             .map_err(|error| {
                 if error.kind == ErrorKind::NotFound {
-                    TreeError::NotFound
+                    TreeError::MissingRoot
                 } else {
                     TreeError::Registry(error)
                 }
@@ -533,7 +533,7 @@ impl TreeStore {
         let _guard = self.writer.lock().await;
         match self.resolve_root(authorization).await {
             Ok(root) => Ok(root.descriptor.digest()?),
-            Err(TreeError::NotFound) => {
+            Err(TreeError::MissingRoot) => {
                 let root = self
                     .upload_index(&OciIndex::new(IndexKind::Leaf, Vec::new()), authorization)
                     .await?;

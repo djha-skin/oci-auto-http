@@ -321,7 +321,7 @@ impl TreeStore {
     async fn ensure_root(&self, authorization: Option<&HeaderValue>) -> Result<PageRef, TreeError> {
         match self.resolve_root(authorization).await {
             Ok(root) => Ok(root),
-            Err(TreeError::NotFound) => {
+            Err(TreeError::MissingRoot) => {
                 let root = self
                     .upload_index(&OciIndex::new(IndexKind::Leaf, Vec::new()), authorization)
                     .await?;

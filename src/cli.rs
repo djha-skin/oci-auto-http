@@ -43,6 +43,9 @@ pub struct ServeArgs {
     /// Version-1 TOML configuration file.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
+    /// Additional PEM CA certificate for the configured registries.
+    #[arg(long, value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
     /// Override the listen address configured in the file.
     #[arg(long)]
     pub listen: Option<SocketAddr>,

@@ -50,6 +50,8 @@ pub enum TreeError {
     InputStream,
     #[error("tree entry was not found")]
     NotFound,
+    #[error("configured OCI tree root is missing")]
+    MissingRoot,
     #[error("tree entry is not a file")]
     NotFile,
     #[error("tree entry is not a directory")]
