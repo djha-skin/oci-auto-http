@@ -788,6 +788,28 @@ fn documented_container_config_is_accepted_by_the_mount_cli_without_registry_acc
     );
 }
 
+#[test]
+fn compose_stop_grace_exceeds_the_container_configured_drain_period() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let container_config = root.join("deploy/config.container.example.toml");
+    let config = oci_auto_http::config::Config::load(&container_config).unwrap();
+    let compose = fs::read_to_string(root.join("compose.yaml")).unwrap();
+    let stop_grace_seconds = compose
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("stop_grace_period:"))
+        .unwrap()
+        .trim()
+        .strip_suffix('s')
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        stop_grace_seconds > config.server.graceful_shutdown_timeout.as_secs(),
+        "Compose stop grace ({stop_grace_seconds}s) must exceed the service drain ({:?})",
+        config.server.graceful_shutdown_timeout
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn valid_multiple_mounts_load_without_local_content_state() {

@@ -44,7 +44,7 @@ Do not expose the example Compose binding publicly. Public deployment remains su
 
 ## Docker Compose
 
-The example binds the host port to loopback, runs as a non-root UID, drops Linux capabilities, uses a read-only root filesystem, limits the container to one CPU/384 MiB, and gives private autoindex spools a bounded `/tmp`. It assumes direct HTTPS and an existing server certificate/key. It does not include a healthcheck command in the minimal image; use an external probe. To run the automated image/start/health smoke (`./scripts/smoke-container.sh`), install Docker, OpenSSL, curl, and Python 3; the build pulls the Rust and Debian base images if they are not already cached.
+The example binds the host port to loopback, runs as a non-root UID, drops Linux capabilities, uses a read-only root filesystem, limits the container to one CPU/384 MiB, gives private autoindex spools a bounded `/tmp`, and allows 45 seconds for shutdown (longer than the default 30-second application drain). If you increase `graceful_shutdown_timeout_seconds`, increase Compose's `stop_grace_period` as well. It assumes direct HTTPS and an existing server certificate/key. It does not include a healthcheck command in the minimal image; use an external probe. To run the automated image/start/health smoke (`./scripts/smoke-container.sh`), install Docker, OpenSSL, curl, and Python 3; the build pulls the Rust and Debian base images if they are not already cached.
 
 ```sh
 cp deploy/config.container.example.toml deploy/config.toml
