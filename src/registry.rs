@@ -554,6 +554,7 @@ impl RegistryClient {
                 HeaderValue::from_str(&format!("0-{}", size - 1))
                     .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))?,
             );
+            let challenge_relay_allowed = self.should_forward_authorization(&upload_url);
             let response = self
                 .send_stream_request(
                     Method::PATCH,
@@ -574,7 +575,7 @@ impl RegistryClient {
                 }
             };
             self.validate_upload_source(&state, size, &digest)?;
-            require_status(&response, &[StatusCode::ACCEPTED])?;
+            require_status_with(&response, &[StatusCode::ACCEPTED], challenge_relay_allowed)?;
             upload_url = response_location(&response, &upload_url)?;
             self.validate_upload_url(&upload_url)?;
         } else {
@@ -609,6 +610,7 @@ impl RegistryClient {
         let mut finish_headers = HeaderMap::new();
         finish_headers.insert(CONTENT_TYPE, HeaderValue::from_static(OCI_BLOB));
         finish_headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        let challenge_relay_allowed = self.should_forward_authorization(&upload_url);
         let response = self
             .send_request(
                 Method::PUT,
@@ -619,7 +621,7 @@ impl RegistryClient {
                 false,
             )
             .await?;
-        require_status(&response, &[StatusCode::CREATED])?;
+        require_status_with(&response, &[StatusCode::CREATED], challenge_relay_allowed)?;
         if optional_digest(response.headers())?.is_some_and(|claimed| claimed != digest) {
             return Err(RegistryError::new(ErrorKind::DigestMismatch));
         }
@@ -799,6 +801,15 @@ impl RegistryClient {
                 )
                 .await?;
             if !is_redirect(response.status()) {
+                if url.origin() != self.mount.registry.origin()
+                    && response.status() != StatusCode::OK
+                {
+                    return Err(response_error_parts(
+                        response.status(),
+                        response.headers(),
+                        false,
+                    ));
+                }
                 return Ok(response);
             }
             if hop == self.policy.max_redirects {
@@ -843,6 +854,15 @@ impl RegistryClient {
     fn validate_upload_url(&self, url: &Url) -> Result<(), RegistryError> {
         if !self.permitted_blob_target(url) || url.query_pairs().any(|(key, _)| key == "digest") {
             return Err(RegistryError::new(ErrorKind::RedirectDenied));
+        }
+        if url.origin() == self.mount.registry.origin() {
+            let upload_prefix = format!("/v2/{}/blobs/uploads/", self.mount.repository);
+            let Some(session) = url.path().strip_prefix(&upload_prefix) else {
+                return Err(RegistryError::new(ErrorKind::RedirectDenied));
+            };
+            if session.is_empty() || session.contains('/') {
+                return Err(RegistryError::new(ErrorKind::RedirectDenied));
+            }
         }
         Ok(())
     }
@@ -1065,6 +1085,8 @@ pub struct RegistryError {
     pub status: Option<StatusCode>,
     pub challenges: Vec<HeaderValue>,
     pub retry_after: Option<HeaderValue>,
+    /// Whether challenges came from the configured registry and may be relayed.
+    pub challenge_relay_allowed: bool,
 }
 
 impl RegistryError {
@@ -1074,6 +1096,7 @@ impl RegistryError {
             status: None,
             challenges: Vec::new(),
             retry_after: None,
+            challenge_relay_allowed: false,
         }
     }
 }
@@ -1084,6 +1107,7 @@ impl fmt::Debug for RegistryError {
             .debug_struct("RegistryError")
             .field("kind", &self.kind)
             .field("status", &self.status)
+            .field("challenge_relay_allowed", &self.challenge_relay_allowed)
             .finish_non_exhaustive()
     }
 }
@@ -1107,6 +1131,22 @@ fn require_status(response: &Response, accepted: &[StatusCode]) -> Result<(), Re
     }
 }
 
+fn require_status_with(
+    response: &Response,
+    accepted: &[StatusCode],
+    challenge_relay_allowed: bool,
+) -> Result<(), RegistryError> {
+    if accepted.contains(&response.status()) {
+        Ok(())
+    } else {
+        Err(response_error_parts(
+            response.status(),
+            response.headers(),
+            challenge_relay_allowed,
+        ))
+    }
+}
+
 fn response_location(response: &Response, base: &Url) -> Result<Url, RegistryError> {
     let location = response
         .headers()
@@ -1119,10 +1159,14 @@ fn response_location(response: &Response, base: &Url) -> Result<Url, RegistryErr
 }
 
 fn response_error(response: &Response) -> RegistryError {
-    response_error_parts(response.status(), response.headers())
+    response_error_parts(response.status(), response.headers(), true)
 }
 
-fn response_error_parts(status: StatusCode, headers: &HeaderMap) -> RegistryError {
+fn response_error_parts(
+    status: StatusCode,
+    headers: &HeaderMap,
+    challenge_relay_allowed: bool,
+) -> RegistryError {
     let kind = match status {
         StatusCode::NOT_FOUND => ErrorKind::NotFound,
         StatusCode::UNAUTHORIZED => ErrorKind::Unauthorized,
@@ -1135,8 +1179,15 @@ fn response_error_parts(status: StatusCode, headers: &HeaderMap) -> RegistryErro
     RegistryError {
         kind,
         status: Some(status),
-        challenges: headers.get_all(WWW_AUTHENTICATE).iter().cloned().collect(),
-        retry_after: headers.get(RETRY_AFTER).cloned(),
+        challenges: if challenge_relay_allowed {
+            headers.get_all(WWW_AUTHENTICATE).iter().cloned().collect()
+        } else {
+            Vec::new()
+        },
+        retry_after: challenge_relay_allowed
+            .then(|| headers.get(RETRY_AFTER).cloned())
+            .flatten(),
+        challenge_relay_allowed,
     }
 }
 
@@ -1270,11 +1321,14 @@ fn next_link(
                 let url = current
                     .join(target)
                     .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))?;
+                let expected_path = format!("/v2/{}/tags/list", mount.repository);
                 if url.origin() != mount.registry.origin()
                     || url.scheme() != "https"
                     || !url.username().is_empty()
                     || url.password().is_some()
                     || url.fragment().is_some()
+                    || url.path() != expected_path
+                    || !valid_tag_page_query(&url)
                 {
                     return Err(RegistryError::new(ErrorKind::RedirectDenied));
                 }
@@ -1284,6 +1338,19 @@ fn next_link(
         }
     }
     Ok(None)
+}
+
+fn valid_tag_page_query(url: &Url) -> bool {
+    let mut page_size_seen = false;
+    let mut last_tag_seen = false;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "n" if !page_size_seen && value == "100" => page_size_seen = true,
+            "last" if !last_tag_seen && valid_tag(&value) => last_tag_seen = true,
+            _ => return false,
+        }
+    }
+    page_size_seen && last_tag_seen
 }
 
 fn retryable_status(status: StatusCode) -> bool {
@@ -1402,12 +1469,18 @@ mod tests {
             ),
         );
         headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
-        let error = response_error_parts(StatusCode::UNAUTHORIZED, &headers);
+        let error = response_error_parts(StatusCode::UNAUTHORIZED, &headers, true);
         assert_eq!(error.kind, ErrorKind::Unauthorized);
+        assert!(error.challenge_relay_allowed);
         assert_eq!(error.challenges, [headers[WWW_AUTHENTICATE].clone()]);
         assert_eq!(error.retry_after, headers.get(RETRY_AFTER).cloned());
         assert!(!format!("{error}").contains("do-not-log"));
         assert!(!format!("{error:?}").contains("do-not-log"));
+
+        let redirected = response_error_parts(StatusCode::UNAUTHORIZED, &headers, false);
+        assert!(!redirected.challenge_relay_allowed);
+        assert!(redirected.challenges.is_empty());
+        assert!(redirected.retry_after.is_none());
     }
 
     #[test]
@@ -1482,6 +1555,26 @@ mod tests {
         headers.insert(
             LINK,
             HeaderValue::from_static("<https://evil.example/tags>; rel=\"next\""),
+        );
+        assert_eq!(
+            next_link(&headers, &current, &mount).unwrap_err().kind,
+            ErrorKind::RedirectDenied
+        );
+        headers.insert(
+            LINK,
+            HeaderValue::from_static(
+                "<https://registry.example/v2/team/other/tags/list?n=100&last=alpha>; rel=\"next\"",
+            ),
+        );
+        assert_eq!(
+            next_link(&headers, &current, &mount).unwrap_err().kind,
+            ErrorKind::RedirectDenied
+        );
+        headers.insert(
+            LINK,
+            HeaderValue::from_static(
+                "</v2/team/releases/tags/list?n=100&last=alpha&token=secret>; rel=\"next\"",
+            ),
         );
         assert_eq!(
             next_link(&headers, &current, &mount).unwrap_err().kind,
@@ -1572,6 +1665,41 @@ mod tests {
         assert!(!client.should_forward_authorization(
             &Url::parse("https://cdn.example/v2?signature=secret").unwrap()
         ));
+    }
+
+    #[test]
+    fn upload_locations_stay_in_the_selected_repository() {
+        let mut mount = test_mount();
+        mount.redirect_allowlist = vec!["cdn.example:443".to_owned()];
+        let client = RegistryClient::new(mount, ClientPolicy::default()).unwrap();
+        let valid = Url::parse(
+            "https://registry.example/v2/team/releases/blobs/uploads/session-id?_state=opaque",
+        )
+        .unwrap();
+        assert!(client.validate_upload_url(&valid).is_ok());
+
+        let wrong_repository = Url::parse(
+            "https://registry.example/v2/team/other/blobs/uploads/session-id?_state=opaque",
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .validate_upload_url(&wrong_repository)
+                .unwrap_err()
+                .kind,
+            ErrorKind::RedirectDenied
+        );
+        let wrong_endpoint = Url::parse("https://registry.example/v2/admin/session-id").unwrap();
+        assert_eq!(
+            client
+                .validate_upload_url(&wrong_endpoint)
+                .unwrap_err()
+                .kind,
+            ErrorKind::RedirectDenied
+        );
+        let allowed_store =
+            Url::parse("https://cdn.example/object/session-id?signature=opaque").unwrap();
+        assert!(client.validate_upload_url(&allowed_store).is_ok());
     }
 
     #[test]
