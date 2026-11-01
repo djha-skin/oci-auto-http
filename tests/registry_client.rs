@@ -2304,6 +2304,14 @@ async fn serve_streams_concurrent_files_with_bounded_rss() {
         .await
         .unwrap();
     }
+    tree.write_file(
+        &StoragePath::parse_relative("latency.txt").unwrap(),
+        Bytes::from(vec![0x33; 1024]),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
     drop(tree);
 
     let scratch = TempDir::new();
@@ -2317,9 +2325,11 @@ async fn serve_streams_concurrent_files_with_bounded_rss() {
     )
     .unwrap();
     let address = unused_http_address();
-    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    let (mut server, resource_profile) =
+        spawn_resource_limited_http_server(&config_path, &registry.certificate, address);
     wait_for_http_server(&mut server.child, address);
     let pid = server.child.id();
+    assert_resource_profile(pid, &resource_profile);
     let baseline_rss = process_rss_bytes(pid);
 
     let started = Instant::now();
@@ -2344,10 +2354,41 @@ async fn serve_streams_concurrent_files_with_bounded_rss() {
         "server RSS grew by {peak_rss_delta} bytes for {aggregate_size} concurrent response bytes"
     );
     println!(
-        "resource-measurement scenario=concurrent-slow-reader concurrency=2 reader_delay_ms_per_64k=1 object_bytes_each={file_size} wall_elapsed_ms={} aggregate_throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
+        "resource-measurement scenario=concurrent-slow-reader profile={resource_profile} concurrency=2 reader_delay_ms_per_64k=1 object_bytes_each={file_size} wall_elapsed_ms={} aggregate_throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
         wall_time.as_millis(),
         aggregate_size as f64 / (1024.0 * 1024.0) / wall_time.as_secs_f64(),
         aggregate_size / 2
+    );
+    let address_for_latency = address;
+    let latencies = tokio::task::spawn_blocking(move || {
+        let mut samples = Vec::with_capacity(24);
+        for _ in 0..24 {
+            let started = Instant::now();
+            let response =
+                http_request(address_for_latency, "GET", "/files/latency.txt", &[]).unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, vec![0x33; 1024]);
+            samples.push(started.elapsed());
+        }
+        samples
+    })
+    .await
+    .unwrap();
+    let mut latency_millis = latencies
+        .iter()
+        .map(Duration::as_millis)
+        .collect::<Vec<_>>();
+    latency_millis.sort_unstable();
+    let p50_ms = latency_millis[latency_millis.len() / 2];
+    let p95_ms = latency_millis[(latency_millis.len() * 95).div_ceil(100) - 1];
+    const SMALL_FILE_P95_TARGET_MS: u128 = 1_000;
+    assert!(
+        p95_ms <= SMALL_FILE_P95_TARGET_MS,
+        "small-file p95 latency was {p95_ms} ms; target is {SMALL_FILE_P95_TARGET_MS} ms under {resource_profile}"
+    );
+    println!(
+        "latency-measurement scenario=small-file profile={resource_profile} requests={} object_bytes=1024 p50_ms={p50_ms} p95_ms={p95_ms} p95_target_ms={SMALL_FILE_P95_TARGET_MS}",
+        latency_millis.len()
     );
     stop_http_server(&mut server);
 }
@@ -2400,9 +2441,10 @@ repository = "team/releases"
     )
     .unwrap();
     let direct_address = unused_http_address();
-    let mut direct_server =
-        spawn_http_server(&direct_config, &registry.certificate, direct_address);
+    let (mut direct_server, resource_profile) =
+        spawn_resource_limited_http_server(&direct_config, &registry.certificate, direct_address);
     wait_for_http_server(&mut direct_server.child, direct_address);
+    assert_resource_profile(direct_server.child.id(), &resource_profile);
     let baseline_rss = process_rss_bytes(direct_server.child.id());
     let download =
         stream_http_response(direct_address, "/files/large.bin", direct_server.child.id()).unwrap();
@@ -2419,7 +2461,7 @@ repository = "team/releases"
         "server RSS grew by {peak_rss_delta} bytes while serving a {total_size} byte blob"
     );
     println!(
-        "resource-measurement scenario=single-slow-reader reader_delay_ms_per_64k=1 object_bytes={total_size} elapsed_ms={} throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
+        "resource-measurement scenario=single-slow-reader profile={resource_profile} reader_delay_ms_per_64k=1 object_bytes={total_size} elapsed_ms={} throughput_mib_per_second={:.2} peak_rss_delta_bytes={peak_rss_delta} rss_bound_bytes={}",
         download.elapsed.as_millis(),
         total_size as f64 / (1024.0 * 1024.0) / download.elapsed.as_secs_f64(),
         total_size / 2
@@ -3737,6 +3779,149 @@ impl Drop for RunningHttpServer {
             let _ = self.child.wait();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+const LOW_RESOURCE_ADDRESS_SPACE_BYTES: u64 = 384 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+fn spawn_resource_limited_http_server(
+    config: &Path,
+    certificate: &Path,
+    address: SocketAddr,
+) -> (RunningHttpServer, String) {
+    let systemd_available = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--property=MemoryMax=384M",
+            "--property=CPUQuota=100%",
+            "--",
+            "true",
+        ])
+        .status()
+        .is_ok_and(|status| status.success());
+    let (mut command, resource_profile) = if systemd_available {
+        let mut command = Command::new("systemd-run");
+        command.args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--property=MemoryMax=384M",
+            "--property=CPUQuota=100%",
+            "--",
+        ]);
+        (command, "cgroup-cpu-100pct-memory-384m".to_owned())
+    } else {
+        let cpu = first_allowed_cpu();
+        let mut command = Command::new("taskset");
+        command.args(["--cpu-list", &cpu, "prlimit", "--as=402653184", "--"]);
+        (command, format!("cpu-affinity-{cpu}-address-space-384m"))
+    };
+    let child = command
+        .arg(cli_binary())
+        .args(["--log-format", "json", "serve", "--config"])
+        .arg(config)
+        .args(["--ca-cert"])
+        .arg(certificate)
+        .args(["--listen", &address.to_string()])
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (
+        RunningHttpServer {
+            child,
+            stopped: false,
+        },
+        resource_profile,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn first_allowed_cpu() -> String {
+    fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .unwrap()
+        .trim()
+        .split(',')
+        .next()
+        .unwrap()
+        .split('-')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_resource_profile(pid: u32, profile: &str) {
+    if profile.starts_with("cgroup-") {
+        let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap()
+            .to_owned();
+        let cgroup_dir = Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
+        let memory_limit = fs::read_to_string(cgroup_dir.join("memory.max"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(memory_limit, LOW_RESOURCE_ADDRESS_SPACE_BYTES);
+        let cpu_max = fs::read_to_string(cgroup_dir.join("cpu.max")).unwrap();
+        let mut cpu_limits = cpu_max.split_whitespace();
+        let quota = cpu_limits.next().unwrap().parse::<u64>().unwrap();
+        let period = cpu_limits.next().unwrap().parse::<u64>().unwrap();
+        assert!(
+            quota <= period,
+            "resource cgroup allows more than one CPU: {cpu_max}"
+        );
+    } else {
+        assert_eq!(process_cpu_count(pid), 1);
+        assert_eq!(
+            process_address_space_limit(pid),
+            LOW_RESOURCE_ADDRESS_SPACE_BYTES
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_count(pid: u32) -> usize {
+    let allowed = fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    allowed
+        .split(',')
+        .map(|part| {
+            part.split_once('-').map_or(1, |(start, end)| {
+                end.parse::<usize>().unwrap() - start.parse::<usize>().unwrap() + 1
+            })
+        })
+        .sum()
+}
+
+#[cfg(target_os = "linux")]
+fn process_address_space_limit(pid: u32) -> u64 {
+    fs::read_to_string(format!("/proc/{pid}/limits"))
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("Max address space"))
+        .unwrap()
+        .split_whitespace()
+        .nth(3)
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 fn spawn_http_server(config: &Path, certificate: &Path, address: SocketAddr) -> RunningHttpServer {
