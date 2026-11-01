@@ -935,10 +935,18 @@ repository = "team/releases"
     let mut server = spawn_http_server(&config_path, &registry.certificate, address);
     wait_for_http_server(&mut server.child, address);
 
-    let root = http_request(address, "GET", "/files/", &[]).unwrap();
+    let root = http_request(
+        address,
+        "GET",
+        "/files/?private-query=must-not-appear",
+        &[("Host", "attacker.example")],
+    )
+    .unwrap();
     assert_eq!(root.status, 200);
     let root_html = String::from_utf8(root.body).unwrap();
     assert!(root_html.contains("Index of /files/"));
+    assert!(!root_html.contains("attacker.example"));
+    assert!(!root_html.contains("private-query=must-not-appear"));
     assert!(
         !root_html.contains("href=\"../\""),
         "mount root must not link to a parent"
@@ -1955,8 +1963,15 @@ fn http_request(
 ) -> io::Result<HttpResponse> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(stream, "{method} {target} HTTP/1.1\r\nHost: localhost\r\n")?;
+    let host = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map_or("localhost", |(_, value)| *value);
+    write!(stream, "{method} {target} HTTP/1.1\r\nHost: {host}\r\n")?;
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
         write!(stream, "{name}: {value}\r\n")?;
     }
     stream.write_all(b"Connection: close\r\n\r\n")?;
