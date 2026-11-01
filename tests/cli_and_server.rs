@@ -78,6 +78,15 @@ redirect_allowlist = ["cdn.example:443"]
     .to_owned()
 }
 
+fn run_mount(config: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(binary())
+        .args(["mount", "--config"])
+        .arg(config)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn binary() -> PathBuf {
     ["CARGO_BIN_EXE_oci-auto-http", "CARGO_BIN_EXE_oci_auto_http"]
         .into_iter()
@@ -129,7 +138,7 @@ fn help_exposes_stable_command_groups_and_crud_verbs() {
 }
 
 #[test]
-fn invalid_arguments_and_reserved_commands_fail_actionably() {
+fn invalid_arguments_and_mount_usage_fail_actionably() {
     let invalid = Command::new(binary())
         .arg("--not-a-real-option")
         .output()
@@ -144,47 +153,12 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
     assert_eq!(missing_mount_options.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&missing_mount_options.stderr).contains("required"));
 
-    let reserved = Command::new(binary())
+    let missing_mount_config = Command::new(binary())
         .args(["mount", "list"])
         .output()
         .unwrap();
-    assert_eq!(reserved.status.code(), Some(69));
-    let diagnostic = String::from_utf8_lossy(&reserved.stderr);
-    assert!(
-        diagnostic.contains("mount list is not available yet"),
-        "unexpected reserved-command diagnostic: {diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("no registry request was made"),
-        "{diagnostic}"
-    );
-
-    let filtered = Command::new(binary())
-        .args(["mount", "list"])
-        .env("RUST_LOG", "off")
-        .output()
-        .unwrap();
-    assert_eq!(filtered.status.code(), Some(69));
-    assert!(String::from_utf8_lossy(&filtered.stderr).contains("mount list is not available yet"));
-
-    let json = Command::new(binary())
-        .args(["--log-format", "json", "mount", "list"])
-        .env("RUST_LOG", "off")
-        .output()
-        .unwrap();
-    assert_eq!(json.status.code(), Some(69));
-    let stderr = String::from_utf8(json.stderr).unwrap();
-    let lines: Vec<_> = stderr.lines().collect();
-    assert_eq!(lines.len(), 1, "JSON mode must emit one record: {stderr}");
-    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(record["level"], "ERROR");
-    assert_eq!(record["fields"]["exit_code"], 69);
-    assert!(
-        record["fields"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("no registry request was made")
-    );
+    assert_eq!(missing_mount_config.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_mount_config.stderr).contains("--config"));
 
     let missing_config = Command::new(binary())
         .args(["artifact", "create", "/packages/file"])
@@ -205,6 +179,229 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
             "artifact create help omitted {option}: {help}"
         );
     }
+}
+
+#[test]
+fn mount_create_cli_initializes_a_missing_config_without_registry_access() {
+    let temp = TempDir::new();
+    let config_path = temp.path.join("new-mounts.toml");
+    let created = run_mount(
+        &config_path,
+        &[
+            "create",
+            "packages",
+            "--prefix",
+            "/packages",
+            "--registry",
+            "https://registry.example",
+            "--repository",
+            "team/packages",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "mount create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(output["name"], "packages");
+    assert_eq!(output["prefix"], "/packages");
+    assert_eq!(output["root_tag"], "oci-auto-http-tree-v1");
+    assert_eq!(output["redirect_allowlist"], serde_json::json!([]));
+    assert!(config_path.is_file());
+
+    let config = oci_auto_http::config::Config::load(&config_path).unwrap();
+    assert_eq!(config.mounts.len(), 1);
+    assert_eq!(config.mounts[0].repository, "team/packages");
+}
+
+#[test]
+fn mount_crud_cli_preserves_comments_and_rejects_invalid_changes_atomically() {
+    let temp = TempDir::new();
+    let config_path = temp.write_config(
+        r#"# Keep the operator header.
+version = 1
+
+[server]
+listen = "127.0.0.1:9999" # Keep listen.
+
+[[mounts]]
+# Keep the package comment.
+name = "packages"
+prefix = "/packages" # Keep prefix.
+registry = "https://reg-a.example"
+repository = "team/packages"
+root_tag = "packages-v2"
+redirect_allowlist = ["cdn-a.example:443"]
+"#,
+    );
+
+    let created = run_mount(
+        &config_path,
+        &[
+            "create",
+            "mirror",
+            "--prefix",
+            "/mirror",
+            "--registry",
+            "https://reg-b.example:5443",
+            "--repository",
+            "team/mirror",
+            "--root-tag",
+            "mirror-v1",
+            "--redirect-allowlist",
+            "cdn-b.example:443",
+            "--redirect-allowlist",
+            "cdn-c.example:8443",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "mount create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created_json["root_tag"], "mirror-v1");
+    assert_eq!(
+        created_json["redirect_allowlist"],
+        serde_json::json!(["cdn-b.example:443", "cdn-c.example:8443"])
+    );
+
+    let listing = run_mount(&config_path, &["list"]);
+    assert!(listing.status.success());
+    let mounts: Vec<serde_json::Value> = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0]["name"], "packages");
+    assert_eq!(mounts[1]["name"], "mirror");
+
+    let shown = run_mount(&config_path, &["show", "packages"]);
+    assert!(shown.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["repository"], "team/packages");
+
+    let config_before_duplicate = fs::read(&config_path).unwrap();
+    let duplicate = run_mount(
+        &config_path,
+        &[
+            "create",
+            "packages",
+            "--prefix",
+            "/another",
+            "--registry",
+            "https://reg-a.example",
+            "--repository",
+            "team/another",
+        ],
+    );
+    assert_eq!(duplicate.status.code(), Some(73));
+    assert_eq!(fs::read(&config_path).unwrap(), config_before_duplicate);
+
+    let updated = run_mount(
+        &config_path,
+        &[
+            "update",
+            "mirror",
+            "--prefix",
+            "/mirror-v2",
+            "--registry",
+            "https://reg-c.example:5443",
+            "--repository",
+            "team/new-mirror",
+            "--root-tag",
+            "mirror-v2",
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "mount update failed: {}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let updated: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated["prefix"], "/mirror-v2");
+    assert_eq!(updated["repository"], "team/new-mirror");
+    assert_eq!(updated["root_tag"], "mirror-v2");
+    assert_eq!(updated["redirect_allowlist"].as_array().unwrap().len(), 2);
+
+    let replaced_redirects = run_mount(
+        &config_path,
+        &[
+            "update",
+            "mirror",
+            "--redirect-allowlist",
+            "cdn-d.example:443",
+            "--redirect-allowlist",
+            "cdn-e.example:8443",
+        ],
+    );
+    assert!(replaced_redirects.status.success());
+    let replaced_redirects: serde_json::Value =
+        serde_json::from_slice(&replaced_redirects.stdout).unwrap();
+    assert_eq!(
+        replaced_redirects["redirect_allowlist"],
+        serde_json::json!(["cdn-d.example:443", "cdn-e.example:8443"])
+    );
+
+    let reset = run_mount(
+        &config_path,
+        &[
+            "update",
+            "mirror",
+            "--reset-root-tag",
+            "--clear-redirect-allowlist",
+        ],
+    );
+    assert!(reset.status.success());
+    let reset: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(reset["root_tag"], "oci-auto-http-tree-v1");
+    assert_eq!(reset["redirect_allowlist"], serde_json::json!([]));
+
+    let config_before_invalid_update = fs::read(&config_path).unwrap();
+    let invalid_update = run_mount(
+        &config_path,
+        &["update", "mirror", "--prefix", "/packages/nested"],
+    );
+    assert_eq!(invalid_update.status.code(), Some(2));
+    assert_eq!(
+        fs::read(&config_path).unwrap(),
+        config_before_invalid_update
+    );
+    let empty_update = run_mount(&config_path, &["update", "mirror"]);
+    assert_eq!(empty_update.status.code(), Some(2));
+
+    let rendered = fs::read_to_string(&config_path).unwrap();
+    for comment in [
+        "# Keep the operator header.",
+        "# Keep listen.",
+        "# Keep the package comment.",
+        "# Keep prefix.",
+    ] {
+        assert!(rendered.contains(comment), "lost TOML comment {comment:?}");
+    }
+    assert!(rendered.contains("listen = \"127.0.0.1:9999\""));
+
+    let deleted = run_mount(&config_path, &["delete", "mirror"]);
+    assert!(deleted.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deleted.stdout).unwrap(),
+        serde_json::json!({"deleted": "mirror"})
+    );
+    let config_before_last_delete = fs::read(&config_path).unwrap();
+    let last_mount = run_mount(&config_path, &["delete", "packages"]);
+    assert_eq!(last_mount.status.code(), Some(73));
+    assert_eq!(fs::read(&config_path).unwrap(), config_before_last_delete);
+
+    for args in [
+        ["show", "missing"].as_slice(),
+        ["delete", "missing"].as_slice(),
+    ] {
+        let missing = run_mount(&config_path, args);
+        assert_eq!(missing.status.code(), Some(66));
+    }
+    let missing_update = run_mount(
+        &config_path,
+        &["update", "missing", "--repository", "team/missing"],
+    );
+    assert_eq!(missing_update.status.code(), Some(66));
 }
 
 #[test]

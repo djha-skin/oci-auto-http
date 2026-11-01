@@ -10,7 +10,7 @@ cargo test --locked
 cargo run -- --help
 ```
 
-The foundation exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact CRUD commands now operate on OCI-backed tree paths using a version-1 TOML mount configuration. Mount CRUD verbs remain reserved and return an actionable “not available yet” error without contacting a registry.
+The application exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact CRUD commands operate on OCI-backed tree paths; mount CRUD commands manage the version-1 TOML configuration without contacting a registry.
 
 Start the listener with a TOML configuration file:
 
@@ -24,6 +24,22 @@ cargo run -- serve --config config.example.toml
 ## Configuration
 
 Configuration is version-1 TOML. `version` is required; `[server].listen` defaults to `127.0.0.1:8080`. Each `[[mounts]]` entry requires a unique lowercase alphanumeric/hyphen `name`, a canonical absolute URI `prefix`, an HTTPS registry origin without userinfo/path/query/fragment, and an OCI repository name. Prefixes are decoded once, component-boundary matched, and must not overlap. `root_tag` defaults to `oci-auto-http-tree-v1`. `redirect_allowlist` contains exact HTTPS authorities (`host:port`, default port 443) for permitted blob redirects. Unknown fields and unsupported versions fail before listening. Registry credentials are never placed in this file. This listener currently uses plain HTTP and rejects incoming Authorization headers with `403`; secure client transport and safe credential pass-through are separate F10 work.
+
+## Mount commands
+
+Mount commands read and validate the selected TOML file, then print JSON to standard output. `create` initializes a missing config file with version 1; `list` prints a JSON array, `show` prints one mount, and successful mutations print the affected mount or deleted name. Configuration edits preserve unrelated TOML comments/formatting, validate the complete result before writing, and atomically replace a regular non-symlink file. They never contact a registry. The final mount cannot be deleted, and a mount's name is immutable.
+
+```sh
+cargo run -- mount --config ./config.toml create packages \
+  --prefix /packages --registry https://registry.example --repository team/packages
+cargo run -- mount --config ./config.toml list
+cargo run -- mount --config ./config.toml show packages
+cargo run -- mount --config ./config.toml update packages --prefix /releases --root-tag releases-v2
+cargo run -- mount --config ./config.toml update packages --reset-root-tag --clear-redirect-allowlist
+cargo run -- mount --config ./config.toml delete packages
+```
+
+`update` changes only fields supplied: `--prefix`, `--registry`, `--repository`, `--root-tag`, and repeatable `--redirect-allowlist AUTHORITY`. Use `--reset-root-tag` to restore the default root tag or `--clear-redirect-allowlist` to remove redirect exceptions. Mount names follow the configuration grammar; invalid or overlapping mount definitions are rejected before the file is changed.
 
 The package requires Rust 1.88 or newer.
 
@@ -55,7 +71,7 @@ cargo run -- artifact --config ./config.toml delete /packages/hello.txt
 
 Input and output are streamed with bounded memory; standard input is staged in a temporary file so its digest and size can be verified before upload. `--ca-cert FILE` supplies an additional PEM CA certificate for a private registry. These commands currently use anonymous registry access; `--ca-cert` configures TLS trust, not registry credentials. Mutations to the same tree from separate CLI processes or services must be externally serialized; OCI tag updates do not provide portable compare-and-swap.
 
-Stable exit codes: `2` usage/config/path errors, `65` integrity/content validation, `66` missing paths, `69` reserved commands, `70` internal errors, `73` conflicts, `74` registry/I/O failures, `75` stale cursors or uncertain commits, `77` authorization failures, and `78` invalid mount targets.
+Stable exit codes: `2` usage/config/path errors, `65` integrity/content validation, `66` missing paths or mounts, `70` internal errors, `73` conflicts (including duplicate mounts or deleting the final mount), `74` registry/I/O failures, `75` stale cursors, uncertain commits, or concurrent config edits, `77` authorization failures, and `78` invalid mount targets.
 
 ## OCI tree storage library
 
@@ -65,7 +81,7 @@ Library callers can use `StoragePath::parse_relative` for already-decoded relati
 
 Use `--log-format text` (default) or `--log-format json` to select stderr logging. `RUST_LOG` controls the tracing filter; invalid filters fall back to `info`. Credentials and request data are not accepted as command-line arguments.
 
-Run `oci-auto-http <command> --help` for command-specific usage. Invalid command syntax exits `2`; reserved commands exit `69` (`EX_UNAVAILABLE`) with a diagnostic and make no registry request.
+Run `oci-auto-http <command> --help` for command-specific usage. Invalid command syntax exits `2`; mount CRUD only edits local configuration and makes no registry request.
 
 ## Behavior tests
 

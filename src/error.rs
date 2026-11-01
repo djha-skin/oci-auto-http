@@ -19,14 +19,24 @@ pub enum AppError {
     Serve(#[from] std::io::Error),
     #[error("invalid configuration in {path}: {reason}")]
     InvalidConfig { path: PathBuf, reason: String },
-    #[error("{command} is not available yet; no registry request was made")]
-    NotImplemented { command: &'static str },
     #[error("artifact path must be an absolute served path matching a configured mount")]
     InvalidServedPath,
     #[error("artifact path does not match a configured mount")]
     NoMountForPath,
     #[error("artifact list path is required when the config has multiple mounts")]
     ListPathRequired,
+    #[error("mount `{name}` already exists")]
+    MountAlreadyExists { name: String },
+    #[error("mount `{name}` does not exist")]
+    MountNotFound { name: String },
+    #[error("cannot delete the final mount from a valid service configuration")]
+    CannotDeleteLastMount,
+    #[error("mount update must specify at least one field")]
+    EmptyMountUpdate,
+    #[error("mount configuration changed during the update; reload it and retry")]
+    MountConfigChanged,
+    #[error("mount configuration I/O failed: {0}")]
+    MountConfigIo(#[source] io::Error),
     #[error("artifact input failed: {0}")]
     ArtifactInput(#[source] io::Error),
     #[error("artifact output failed: {0}")]
@@ -48,14 +58,18 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// Exit code 69 follows sysexits(3)'s EX_UNAVAILABLE for reserved commands.
+    /// Map application failures to stable command-line exit codes.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NotImplemented { .. } => 69,
             Self::InvalidConfig { .. }
             | Self::InvalidServedPath
             | Self::NoMountForPath
-            | Self::ListPathRequired => 2,
+            | Self::ListPathRequired
+            | Self::EmptyMountUpdate => 2,
+            Self::MountNotFound { .. } => 66,
+            Self::MountAlreadyExists { .. } | Self::CannotDeleteLastMount => 73,
+            Self::MountConfigChanged => 75,
+            Self::MountConfigIo(_) => 74,
             Self::Tree(error) => tree_exit_code(error),
             Self::Registry(error) => registry_exit_code(error),
             Self::ArtifactInput(_) | Self::ArtifactOutput(_) | Self::Certificate(_) => 74,

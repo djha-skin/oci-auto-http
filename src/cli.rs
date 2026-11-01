@@ -32,10 +32,7 @@ pub enum Command {
     /// Create, read, list, update, or delete tree artifacts.
     Artifact(ArtifactArgs),
     /// Create and manage HTTP-to-registry mounts.
-    Mount {
-        #[command(subcommand)]
-        command: MountCommand,
-    },
+    Mount(MountArgs),
 }
 
 #[derive(Debug, Args)]
@@ -110,26 +107,67 @@ pub enum ArtifactCommand {
     },
 }
 
+#[derive(Debug, Args)]
+pub struct MountArgs {
+    /// Version-1 TOML configuration file to manage.
+    #[arg(long, value_name = "FILE")]
+    pub config: PathBuf,
+    #[command(subcommand)]
+    pub command: MountCommand,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum MountCommand {
     /// Create a mount backed by an OCI registry repository.
     Create {
+        /// Stable mount name.
         name: String,
+        /// Canonical absolute URL prefix.
         #[arg(long)]
         prefix: String,
+        /// HTTPS registry origin.
         #[arg(long)]
         registry: String,
+        /// OCI repository name.
         #[arg(long)]
         repository: String,
-        #[arg(long, default_value = "oci-auto-http-tree-v1")]
-        root_tag: String,
+        /// Root OCI tag (defaults to oci-auto-http-tree-v1).
+        #[arg(long)]
+        root_tag: Option<String>,
+        /// Exact HTTPS authority allowed for blob redirects (repeatable).
+        #[arg(long, value_name = "AUTHORITY", action = clap::ArgAction::Append)]
+        redirect_allowlist: Vec<String>,
     },
-    /// List configured mounts.
+    /// List configured mounts as a JSON array.
     List,
-    /// Show one configured mount.
+    /// Show one configured mount as JSON.
     Show { name: String },
-    /// Update a configured mount.
-    Update { name: String },
-    /// Delete a configured mount.
+    /// Update explicitly selected fields of a configured mount.
+    Update {
+        /// Stable mount name (cannot be changed).
+        name: String,
+        /// New canonical absolute URL prefix.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// New HTTPS registry origin.
+        #[arg(long)]
+        registry: Option<String>,
+        /// New OCI repository name.
+        #[arg(long)]
+        repository: Option<String>,
+        /// New root OCI tag.
+        #[arg(long, conflicts_with = "reset_root_tag")]
+        root_tag: Option<String>,
+        /// Reset the root tag to its default.
+        #[arg(long, conflicts_with = "root_tag")]
+        reset_root_tag: bool,
+        /// Replace the redirect allowlist (repeatable).
+        #[arg(long, value_name = "AUTHORITY", action = clap::ArgAction::Append, conflicts_with = "clear_redirect_allowlist")]
+        redirect_allowlist: Option<Vec<String>>,
+        /// Remove all permitted blob redirect authorities.
+        #[arg(long, conflicts_with = "redirect_allowlist")]
+        clear_redirect_allowlist: bool,
+    },
+    /// Delete a configured mount. The final mount cannot be deleted.
     Delete { name: String },
 }
