@@ -107,7 +107,13 @@ async fn route_request(
 ) -> Response {
     let is_head = method == Method::HEAD;
     let response = route_request_inner(state, method, uri, headers).await;
-    if is_head {
+    let directory_head = is_head
+        && response.status() == StatusCode::OK
+        && response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value == "text/html; charset=utf-8");
+    if is_head && !directory_head {
         response.map(|_| Body::empty())
     } else {
         response

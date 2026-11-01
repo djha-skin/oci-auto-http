@@ -156,7 +156,7 @@ pub(super) fn directory_response(
     method: Method,
 ) -> Response {
     let body = if method == Method::HEAD {
-        Body::empty()
+        Body::from_stream(stream::empty::<Result<Bytes, io::Error>>())
     } else {
         let root_digest = first_page.root_digest.clone();
         let phase_finished = first_page.next_cursor.is_none();

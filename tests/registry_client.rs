@@ -861,6 +861,196 @@ repository = "team/empty"
 }
 
 #[tokio::test]
+async fn serve_renders_safe_sorted_paginated_autoindexes_for_real_tree_data() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    for path in ["b-dir", "docs", "empty", "items/z-dir", "deep/a/b"] {
+        tree.create_directory(&StoragePath::parse_relative(path).unwrap(), None)
+            .await
+            .unwrap();
+    }
+    tree.write_file(
+        &StoragePath::parse_relative("a-file.txt").unwrap(),
+        Bytes::from_static(b"root file"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("docs/index.html").unwrap(),
+        Bytes::from_static(b"this document is not an implicit index"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("deep/a/b/leaf.txt").unwrap(),
+        Bytes::from_static(b"deep file"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    for index in 0..127 {
+        tree.write_file(
+            &StoragePath::parse_relative(&format!("items/f{index:03}.txt")).unwrap(),
+            Bytes::from(format!("item {index}")),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let hostile_name = r#"z<script>&" +☃%2F.txt"#;
+    tree.write_file(
+        &StoragePath::parse_relative(&format!("items/{hostile_name}")).unwrap(),
+        Bytes::from_static(b"hostile name content"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("autoindex.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+            registry.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let root = http_request(address, "GET", "/files/", &[]).unwrap();
+    assert_eq!(root.status, 200);
+    let root_html = String::from_utf8(root.body).unwrap();
+    assert!(root_html.contains("Index of /files/"));
+    assert!(
+        !root_html.contains("href=\"../\""),
+        "mount root must not link to a parent"
+    );
+    let root_positions = ["b-dir/", "deep/", "docs/", "empty/", "items/", "a-file.txt"]
+        .map(|name| root_html.find(name).expect("root listing omitted entry"));
+    assert!(root_positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let items = http_request(address, "GET", "/files/items/", &[]).unwrap();
+    assert_eq!(items.status, 200);
+    assert_eq!(
+        items.headers.get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let items_headers = items.headers.clone();
+    let items_content_length = items.headers.get("content-length").cloned();
+    assert_eq!(
+        items.headers.get("content-security-policy").unwrap(),
+        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    assert_eq!(items.headers.get("referrer-policy").unwrap(), "no-referrer");
+    let html = String::from_utf8(items.body).unwrap();
+    assert_eq!(
+        html.matches("<li><a href=").count(),
+        130,
+        "parent plus 129 entries"
+    );
+    assert!(!html.contains("<script>"));
+    assert!(html.contains("&lt;script&gt;&amp;&quot; +☃%2F.txt"));
+    assert!(html.contains("href=\"/files/items/z%3Cscript%3E%26%22%20%2B%E2%98%83%252F.txt\""));
+    let directory_position = html.find("z-dir/</a>").unwrap();
+    let first_file_position = html.find("f000.txt</a>").unwrap();
+    assert!(
+        directory_position < first_file_position,
+        "directories precede files"
+    );
+    let mut previous_position = first_file_position;
+    for index in 1..127 {
+        let name = format!("f{index:03}.txt</a>");
+        let position = html.find(&name).unwrap();
+        assert!(
+            previous_position < position,
+            "file entries are not bytewise sorted"
+        );
+        previous_position = position;
+    }
+    let hostile_position = html
+        .find("&lt;script&gt;&amp;&quot; +☃%2F.txt</a>")
+        .unwrap();
+    assert!(previous_position < hostile_position);
+
+    let empty = http_request(address, "GET", "/files/empty/", &[]).unwrap();
+    assert_eq!(empty.status, 200);
+    let empty_html = String::from_utf8(empty.body).unwrap();
+    assert!(empty_html.contains("href=\"/files/\">../</a>"));
+    assert_eq!(empty_html.matches("<li><a href=").count(), 1);
+
+    let docs = http_request(address, "GET", "/files/docs/", &[]).unwrap();
+    assert_eq!(docs.status, 200);
+    let docs_html = String::from_utf8(docs.body).unwrap();
+    assert!(docs_html.contains("href=\"/files/docs/index.html\">index.html</a>"));
+    assert!(!docs_html.contains("this document is not an implicit index"));
+
+    let deep = http_request(address, "GET", "/files/deep/a/b/", &[]).unwrap();
+    assert_eq!(deep.status, 200);
+    let deep_html = String::from_utf8(deep.body).unwrap();
+    assert!(deep_html.contains("href=\"/files/deep/a/b/leaf.txt\">leaf.txt</a>"));
+
+    let head = http_request(address, "HEAD", "/files/items/", &[]).unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(
+        head.headers.get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        head.headers.get("content-length").cloned(),
+        items_content_length
+    );
+    for name in [
+        "x-content-type-options",
+        "cache-control",
+        "vary",
+        "content-security-policy",
+        "referrer-policy",
+    ] {
+        assert_eq!(
+            head.headers.get(name),
+            items_headers.get(name),
+            "HEAD header {name}"
+        );
+    }
+    let ranged = http_request(address, "GET", "/files/items/", &[("Range", "bytes=0-1")]).unwrap();
+    assert_eq!(ranged.status, 200, "Range is ignored for autoindexes");
+    assert!(!ranged.headers.contains_key("content-range"));
+
+    let before_accept_reject = registry.request_count("team/releases");
+    for accept in ["application/json", "text/html;q=0, */*;q=1"] {
+        let response =
+            http_request(address, "GET", "/files/items/", &[("Accept", accept)]).unwrap();
+        assert_eq!(response.status, 406, "Accept {accept}");
+    }
+    assert_eq!(
+        registry.request_count("team/releases"),
+        before_accept_reject
+    );
+
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains("<script>"));
+}
+
+#[tokio::test]
 async fn serve_file_mime_etag_conditionals_and_ranges_match_the_contract() {
     let registry = TestRegistry::new(false);
     let scratch = TempDir::new();
@@ -1791,11 +1981,48 @@ fn http_request(
             response_headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
         }
     }
+    let raw_body = &raw[header_end + 4..];
+    let body = if response_headers
+        .get("transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        decode_chunked_body(raw_body)?
+    } else {
+        raw_body.to_vec()
+    };
     Ok(HttpResponse {
         status,
         headers: response_headers,
-        body: raw[header_end + 4..].to_vec(),
+        body,
     })
+}
+
+fn decode_chunked_body(body: &[u8]) -> io::Result<Vec<u8>> {
+    let mut position = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = body[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| io::Error::other("malformed chunked HTTP body"))?;
+        let size_line = std::str::from_utf8(&body[position..position + line_end])
+            .map_err(|_| io::Error::other("invalid HTTP chunk size"))?;
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+            .map_err(|_| io::Error::other("invalid HTTP chunk size"))?;
+        position += line_end + 2;
+        if size == 0 {
+            return Ok(decoded);
+        }
+        let end = position
+            .checked_add(size)
+            .filter(|end| end.checked_add(2).is_some_and(|end| end <= body.len()))
+            .ok_or_else(|| io::Error::other("truncated chunked HTTP body"))?;
+        decoded.extend_from_slice(&body[position..end]);
+        if &body[end..end + 2] != b"\r\n" {
+            return Err(io::Error::other("malformed HTTP chunk terminator"));
+        }
+        position = end + 2;
+    }
 }
 
 #[cfg(target_os = "linux")]
