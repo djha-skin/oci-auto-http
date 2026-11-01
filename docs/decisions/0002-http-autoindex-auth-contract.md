@@ -1,0 +1,109 @@
+# ADR 0002: HTTP autoindex and registry-authentication contract
+
+- **Status:** Proposed (concrete conformance vectors and independent review pending)
+- **Version:** 1.0.0
+- **Date:** 2026-11-01
+- **Scope:** Read-only HTTP behavior for mounted OCI trees, directory indexes, client-to-registry credential pass-through, response headers, and security boundaries.
+- **Depends on:** [ADR 0001: OCI tree object model](0001-oci-tree-object-model.md)
+
+## Context and goals
+
+The service presents a generic OCI-backed byte tree as a familiar static HTTP directory. Ordinary file clients use HTTP; they do not have to speak the OCI Distribution protocol. A client may need to authenticate to the selected backing registry, but the service must not introduce a second login system or turn the registry credential into a service credential.
+
+This record defines observable HTTP behavior and the exact forwarding boundary. Path decoding, byte identity, OCI snapshots, and typed storage errors come from ADR 0001. “MUST”, “MUST NOT”, and “SHOULD” are normative.
+
+## Decision
+
+### 1. Routing and method contract
+
+The HTTP listener is read-only. It supports `GET` and `HEAD`; artifact mutation is performed through the separate client/administrative interface. Unsupported methods return `405 Method Not Allowed` with `Allow: GET, HEAD` and MUST NOT access the registry.
+
+Each configured mount has a canonical absolute URL-path prefix. Prefixes are compared on decoded path-component boundaries, not as arbitrary string prefixes: `/pkg` matches `/pkg` and `/pkg/a`, but not `/pkg-old`. Mount configuration MUST reject duplicate or overlapping prefixes before the listener starts; `/` is permitted only as the sole mount. The selected mount is fixed for the whole request. No failed lookup may fall through to another mount. A path outside every mount returns `404`.
+
+The request target MUST be origin-form. The listener validates and decodes the escaped path exactly once under ADR 0001 before storage lookup. Invalid paths, ambiguous separators, malformed escapes, or excessive lengths return `400`; they MUST NOT cause registry access. The query string is not part of storage identity, is ignored for file and directory lookup, is never forwarded upstream, is omitted from generated links and redirects, and MUST NOT be logged. A fragment is not part of an HTTP request target.
+
+The empty relative path denotes the mount root. The mount root and every directory have canonical URLs ending in `/`. A `GET` or `HEAD` for a known directory without its trailing slash returns `301 Moved Permanently` with a `Location` made from the canonical encoded path plus `/`; the original query is not copied. A file requested with a trailing slash, or a missing file/directory, returns `404`. Directory existence is determined from the ADR 0001 tree, not guessed from an OCI error.
+
+A `serve` process MUST NOT initialize or mutate a tree as a side effect of an HTTP `GET` or `HEAD`. A mount whose root tag is absent, unreadable, or not a supported tree MUST fail readiness/startup (or return `503 Service Unavailable` if detected after startup); it is an unavailable mount, not an empty directory. Initialization belongs to the explicit storage/mount operation.
+
+### 2. Directory listings
+
+A `GET` on a directory with a trailing slash returns a generated HTML5 autoindex; a `HEAD` returns the same status and representation headers without a body. The service MUST NOT implicitly choose `index.html` or another file when a directory is requested. A file named `index.html` is served only by requesting that exact file path.
+
+The listing includes a heading for the canonical path, a parent-directory link except at the mount root, and one link for each immediate child. Directories appear before files; within each group, names are sorted by unsigned UTF-8 bytes as specified in ADR 0001. Directories' display names and links end in `/`. The listing is streamed in that order with bounded memory; it contains no inferred timestamps or file sizes because the tree does not store them. Client disconnects stop traversal promptly.
+
+The response is `200 OK` with `Content-Type: text/html; charset=utf-8`, `X-Content-Type-Options: nosniff`, `Cache-Control: private, no-store`, and `Vary: Accept, Authorization`. The HTML is deterministic for the same mount, path, snapshot, and implementation version. All untrusted names and path text MUST be escaped for HTML text and attribute contexts; link components MUST be percent-encoded independently using ADR 0001's canonical URL encoding. Links are relative to the request host (built from the configured mount path); the `Host` header MUST NOT be interpolated into HTML. Query strings are omitted.
+
+The listing contains no script. It MUST send a restrictive policy such as `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` and `Referrer-Policy: no-referrer`. If `Accept` is absent or accepts `text/html` (including `*/*`), the listing is served. If the caller explicitly excludes HTML, return `406 Not Acceptable`; the service does not synthesize JSON, XML, or JSONP indexes. `Range` is ignored for directory listings and the full listing response is `200`.
+
+### 3. File representations and HTTP semantics
+
+A file `GET` streams the exact OCI layer bytes. The response `Content-Type` is selected from built-in MIME map version 1 using a case-insensitive final extension; registry-supplied MIME metadata is not trusted. Version 1 maps `.html`/`.htm` to `text/html; charset=utf-8`, `.css` to `text/css; charset=utf-8`, `.js` to `text/javascript; charset=utf-8`, `.json` to `application/json`, `.xml` to `application/xml`, `.svg` to `image/svg+xml`, `.txt` to `text/plain; charset=utf-8`, `.pdf` to `application/pdf`, `.png` to `image/png`, `.jpg`/`.jpeg` to `image/jpeg`, `.gif` to `image/gif`, `.webp` to `image/webp`, `.wasm` to `application/wasm`, `.tar` to `application/x-tar`, `.gz` to `application/gzip`, and `.zip` to `application/zip`; unknown extensions use `application/octet-stream`. This map conveys no package-specific parsing. Content is never sniffed, compressed, transcoded, or otherwise transformed; the transmitted representation is the exact stored byte sequence and has no HTTP `Content-Encoding`. A full `200` response includes `Content-Length` from the validated OCI descriptor; a `206` response uses the selected byte count. Responses include `ETag`, `Accept-Ranges: bytes`, `X-Content-Type-Options: nosniff`, and `Cache-Control: private, no-store`. The service does not emit `Last-Modified` because no modification time is stored. It does not set `Content-Disposition` based on untrusted registry metadata.
+
+The strong ETag is derived from the ADR 0001 layer digest, formatted as a quoted `sha256-<lowercase-hex>` value. Preconditions are evaluated against that validator before transferring file bytes:
+
+1. `If-Match` supports `*` and entity-tag lists using strong comparison; if it does not match, return `412 Precondition Failed`.
+2. `If-None-Match` supports `*` and entity-tag lists using weak comparison; a match on `GET` or `HEAD` returns `304 Not Modified` with the ETag and cache/security headers and no body.
+3. `If-Unmodified-Since` and `If-Modified-Since` are ignored because the representation has no `Last-Modified` value.
+4. `If-Range` supports a matching strong ETag only. A mismatch, weak tag, or date causes the `Range` to be ignored and the full representation to be returned.
+
+A single `Range: bytes=...` range is supported for files. A satisfiable range returns `206 Partial Content`, `Content-Range: bytes start-end/size`, and `Content-Length` equal to the selected byte count. Suffix and open-ended byte ranges follow RFC 9110 byte-range semantics. A valid but unsatisfiable single range returns `416 Range Not Satisfiable` with `Content-Range: bytes */size`. Malformed or multiple ranges are ignored and produce the full `200` representation, not multipart output. `HEAD` returns the status and headers a corresponding `GET` would return, with no body.
+
+To honor ADR 0001 digest verification, every successful `GET` response (full or range) MUST be based on a complete blob read whose size and digest are checked. An implementation may stream/discard bytes outside the requested interval or use bounded temporary storage, but MUST NOT buffer the whole object in memory. It MUST withhold at least the final response byte until the complete blob digest and size verify; if validation fails, return `502 Bad Gateway` before headers where possible, otherwise terminate without sending the final byte so the declared `Content-Length` is not satisfied, and record a redacted integrity error. For a zero-byte file, validate the empty blob digest before sending a successful response. Backpressure and client disconnects MUST stop upstream reads. A file `HEAD` MUST use the OCI blob `HEAD` operation (following only permitted redirects) and verify a successful status, expected `Content-Length`, and any returned `Docker-Content-Digest` without downloading the body; missing/mismatched blob metadata returns `502`.
+
+File `Accept` does not cause content negotiation: serve the stored bytes with the selected MIME type. Directory and file responses both use `Vary: Authorization` and `Cache-Control: private, no-store`; the service does not permit shared caches to reuse authenticated representations.
+
+### 4. Registry requests and credential boundary
+
+The only caller credential forwarded to a registry is the incoming `Authorization` field. For a request with exactly one such field, the service MUST preserve its field value without parsing/re-encoding Basic, Bearer, or another scheme and pass it only to the selected mount's configured registry origin over TLS. It MUST NOT use server-stored registry credentials, perform a token exchange, prompt for an application login, or add a second authentication layer. If no `Authorization` field is supplied, none is sent upstream. Duplicate `Authorization` fields are rejected with `400` to avoid ambiguous credential selection.
+
+The service MUST NOT forward `Proxy-Authorization`, `Cookie`, caller `Host`, `Forwarded`, `X-Forwarded-*`, or arbitrary caller headers to the registry. It constructs its own OCI `Accept` and protocol headers. Client `Range`/conditional headers are interpreted by the HTTP layer and are not copied blindly to a registry request. The caller's credential is not put in an OCI manifest/config, URL, response body, error, or persistent store.
+
+The configured registry endpoint MUST use HTTPS with normal certificate and hostname verification. An explicit insecure-registry setting, if provided for anonymous development use, MUST NOT enable Authorization pass-through or relay of an authentication challenge. If such a registry returns `401`, the service returns `502` without relaying the challenge. The public HTTP endpoint MUST itself be HTTPS when handling registry-authenticated mounts. If TLS terminates at a reverse proxy, the proxy-to-service hop MUST be trusted/private and the service may rely on secure-transport metadata only from explicitly configured proxy addresses; arbitrary `X-Forwarded-Proto` is untrusted. Requests carrying `Authorization` over an untrusted cleartext hop are rejected before registry access; an auth challenge MUST NOT be sent to a cleartext caller.
+
+For OCI redirects, the service may follow same-origin HTTPS redirects. A cross-origin redirect is followed only when its exact HTTPS authority (host and port, defaulting to 443) is in an explicit per-deployment allowlist (for example, a blob CDN); redirect URLs with userinfo, non-HTTPS schemes, unapproved hosts, or unapproved ports are rejected. Redirect following is bounded (maximum five hops) and loop-detected. The caller's `Authorization`, cookies, and other sensitive fields MUST be stripped on every cross-origin hop and MUST never be sent to an allowlisted blob host. The caller credential is only for the configured registry origin. A challenge from a redirect destination is not relayed as a registry login challenge. Redirect handling MUST NOT permit an untrusted registry response to turn the service into an unrestricted URL fetcher.
+
+For a `401` from the configured HTTPS registry origin on a secure client connection, return `401` and relay every valid `WWW-Authenticate` field value exactly as received, preserving multiple challenges and their order. Do not parse, rewrite, synthesize, or replace a valid challenge. A relayed Bearer `realm` URL, when present, MUST use HTTPS. If the challenge is missing, malformed, contains an insecure Bearer realm, comes from a redirect destination, or the client connection is not secure, do not relay it and return a generic `502` (or `403` for an insecure client connection) instead. The response body is a fixed generic body, not the registry's error body; set `Cache-Control: private, no-store` and `Vary: Authorization`. A registry `403` is returned as `403` with a generic body and no credential details. Other upstream error bodies and `Set-Cookie` headers are not relayed.
+
+### 5. Status and error mapping
+
+| Condition | HTTP response |
+| --- | --- |
+| Invalid/ambiguous/over-limit path (`InvalidPath`) | `400 Bad Request`; no registry access. |
+| No mount or no logical path in the tree | `404 Not Found`; generic body. |
+| Known directory requested without `/` | `301` with canonical encoded `Location`. |
+| Unsupported method | `405`, `Allow: GET, HEAD`; no registry access. |
+| Directory `Accept` explicitly excludes HTML | `406 Not Acceptable`. |
+| Unsatisfiable single byte range | `416` with `Content-Range: bytes */size`. |
+| Configured HTTPS registry returns `401` with a valid challenge over a secure client connection | `401` with status and `WWW-Authenticate` values relayed as above. |
+| Caller sends `Authorization` over an untrusted cleartext connection, or an auth challenge would be relayed to a cleartext caller | `403 Forbidden`; do not forward a credential-bearing request or leak a challenge over cleartext. |
+| Registry returns an invalid/insecure challenge or a redirect destination returns `401` | `502 Bad Gateway`; no challenge from an unconfigured origin is relayed. |
+| Configured registry returns `403` | `403`; generic body. |
+| Registry rate limit | `503 Service Unavailable`; relay a valid `Retry-After` value only. |
+| Missing root tag, registry unavailable, or transient registry failure | `503 Service Unavailable`; generic body. |
+| Corrupt reachable tree, missing referenced manifest/blob, invalid digest, or invalid registry response | `502 Bad Gateway`; generic body and redacted diagnostic. |
+| Upstream timeout | `504 Gateway Timeout`. |
+| Storage result `CommitOutcomeUnknown` / `InvalidCursor` / `StaleCursor` | Not applicable to this read-only file/HTML interface; do not expose storage mutation/listing-cursor APIs here. |
+
+The service does not reveal whether a missing name belongs to another mount or repository. Error bodies MUST NOT contain registry URLs, repository names, credentials, upstream response bodies, or raw query strings. Upstream hop-by-hop headers are removed. Apart from the explicit challenge and `Retry-After` rules, the service creates response headers itself.
+
+### 6. Logging, threat model, and deployment
+
+Paths, headers, query strings, registry responses, and OCI metadata are untrusted. The principal risks are path traversal/cross-mount leakage, HTML injection in autoindex output, accidental credential disclosure, SSRF via registry metadata/redirects, cache leakage, and resource exhaustion from large files/listings/ranges. The path and OCI graph checks in ADR 0001, strict mount selection, output escaping, redirect allowlist, TLS, and bounded streaming mitigate these risks.
+
+The incoming `Authorization` value and `WWW-Authenticate` values are secrets or may contain sensitive scope/token-service data. They MUST be redacted from access logs, tracing spans, panic/error messages, metrics labels, and crash reports. Access logs MUST omit query strings and must not include upstream URLs with signed query parameters. Secret data MUST NOT be retained after the request. The service does not log file content.
+
+Because a writer can create arbitrary files, a stored `.html` or other active content can execute in a browser if served on a trusted origin. Escaping protects only the generated index, not the contents of a file. Deployments SHOULD use a dedicated origin with no privileged application cookies, no ambient trust, and no permissive CORS policy. The server sends no `Access-Control-Allow-*` headers. The registry is trusted to supply the selected tree, subject to TLS and digest/size validation; malformed reachable state is an error, not an invitation to repair it.
+
+File and listing bodies MUST be streamed with bounded memory and backpressure. A listing walks only the pinned tree snapshot and stops on disconnect. Implementations MUST enforce configurable request, registry, and idle timeouts and a concurrency limit; exceeding operational limits returns a generic `503`/`504` before a successful representation is claimed. These controls MUST NOT log secrets. Deployments that enable unauthenticated HTTP are suitable only for anonymous, non-sensitive mounts.
+
+## Worked request/response examples
+
+Assume a secure listener mounted at `/releases`, backed by `https://registry.example:5000`, repository `team/releases`, root tag `oci-auto-http-tree-v1`.
+
+1. `GET /releases/acme/tool%20v2.tar.gz` with no `Range` resolves one root snapshot, streams the exact file bytes, and returns `200`, the digest ETag, exact `Content-Length`, a MIME type selected from the configured extension map (or `application/octet-stream`), `Accept-Ranges: bytes`, and `Cache-Control: private, no-store`.
+2. `HEAD /releases/acme/tool%20v2.tar.gz` returns the same representation headers and status as the corresponding `GET`, with no body and without downloading the file layer solely to answer `HEAD`.
+3. For a ten-byte file whose bytes are `0123456789`, `GET .../sample.bin` with `Range: bytes=2-5` and no failing precondition returns `206`, `Content-Range: bytes 2-5/10`, `Content-Length: 4`, and body `2345`. `Range: bytes=20-` returns `416` and `Content-Range: bytes */10`.
+4. A directory listing containing the names `a&b.txt` and `<script>.txt` displays `a&amp;b.txt` and `&lt;script&gt;.txt` as text and links to `/releases/a%26b.txt` and `/releases/%3Cscript%3E.txt`. The page contains no script and does not include a query string or untrusted `Host` value in its links.
+5. An unauthenticated registry request returning `401` with `WWW-Authenticate: Bearer realm="https://auth.example/token",service="registry.example"` produces client-facing `401` with that exact challenge value. On a retry containing `Authorization: Bearer caller-token`, the service forwards that exact value only to `https://registry.example:5000`; it does not exchange or store it. If the registry accepts it, the file response is returned; if it rejects it, its `401` challenge is relayed again.
+6. A file lookup under `/pkg-other` never matches mount `/pkg`; if `/pkg` and `/pkg/sub` are configured together, configuration is rejected before listening. A request under an unknown prefix returns `404` without contacting any registry.
