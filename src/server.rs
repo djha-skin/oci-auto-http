@@ -160,7 +160,8 @@ async fn route_request_inner(
         };
     }
 
-    match store.read_file(&resolved.storage_path, None).await {
+    let file_result = store.read_file(&resolved.storage_path, None).await;
+    match file_result {
         Ok(file) => file::get_response(file, &resolved.storage_path, &headers).await,
         Err(TreeError::IsDirectory) => {
             match store.list_page(&resolved.storage_path, 1, None, None).await {

@@ -10,14 +10,15 @@ use std::{
     process::{Child, Command, Output, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use axum::body::Body as AxumBody;
 use futures_util::{StreamExt, TryStreamExt};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::TokioIo;
 use oci_auto_http::{
@@ -28,6 +29,10 @@ use oci_auto_http::{
     },
     tree::{EntryKind, StoragePath, TreeError, TreeStore},
 };
+#[cfg(target_os = "linux")]
+use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_rustls::{
     TlsAcceptor,
@@ -847,6 +852,519 @@ repository = "team/empty"
 }
 
 #[tokio::test]
+async fn serve_file_mime_etag_conditionals_and_ranges_match_the_contract() {
+    let registry = TestRegistry::new(false);
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("static-files.toml");
+    let config_text = format!(
+        r#"version = 1
+
+[[mounts]]
+name = "packages"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+        registry.base_url
+    );
+    fs::write(&config_path, &config_text).unwrap();
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let sample = b"0123456789";
+    let sample_path = StoragePath::parse_relative("sample.TXT").unwrap();
+    tree.write_file(&sample_path, Bytes::from_static(sample), false, None)
+        .await
+        .unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("empty.bin").unwrap(),
+        Bytes::new(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+    let url_path = "/files/sample.TXT";
+    let etag = format!(
+        "\"sha256-{}\"",
+        Digest::from_bytes(sample)
+            .as_str()
+            .strip_prefix("sha256:")
+            .unwrap()
+    );
+
+    let get = http_request(address, "GET", url_path, &[]).unwrap();
+    assert_eq!(get.status, 200);
+    assert_eq!(get.body, sample);
+    assert_eq!(
+        get.headers.get("content-type").unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(get.headers.get("content-length").unwrap(), "10");
+    assert_eq!(get.headers.get("etag").unwrap(), &etag);
+    assert_eq!(get.headers.get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(
+        get.headers.get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        get.headers.get("cache-control").unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(get.headers.get("vary").unwrap(), "Authorization");
+    assert!(!get.headers.contains_key("content-encoding"));
+
+    let head = http_request(address, "HEAD", url_path, &[]).unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(head.headers.get("content-length").unwrap(), "10");
+    assert_eq!(
+        head.headers.get("content-type").unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(head.headers.get("etag").unwrap(), &etag);
+    let head_not_modified =
+        http_request(address, "HEAD", url_path, &[("If-None-Match", &etag)]).unwrap();
+    assert_eq!(head_not_modified.status, 304);
+    assert!(head_not_modified.body.is_empty());
+    let head_precondition_failed = http_request(
+        address,
+        "HEAD",
+        url_path,
+        &[("If-Match", "\"not-current\"")],
+    )
+    .unwrap();
+    assert_eq!(head_precondition_failed.status, 412);
+    assert!(head_precondition_failed.body.is_empty());
+
+    for (range, expected, content_range) in [
+        ("bytes=2-5", &b"2345"[..], "bytes 2-5/10"),
+        ("bytes=7-", &b"789"[..], "bytes 7-9/10"),
+        ("bytes=-3", &b"789"[..], "bytes 7-9/10"),
+    ] {
+        let response = http_request(address, "GET", url_path, &[("Range", range)]).unwrap();
+        assert_eq!(response.status, 206, "range {range}");
+        assert_eq!(response.body, expected, "range {range}");
+        assert_eq!(
+            response.headers.get("content-range").unwrap(),
+            content_range
+        );
+        assert_eq!(
+            response.headers.get("content-length").unwrap(),
+            &expected.len().to_string()
+        );
+        assert_eq!(response.headers.get("etag").unwrap(), &etag);
+    }
+    let head_range = http_request(address, "HEAD", url_path, &[("Range", "bytes=2-5")]).unwrap();
+    assert_eq!(head_range.status, 206);
+    assert!(head_range.body.is_empty());
+    assert_eq!(
+        head_range.headers.get("content-range").unwrap(),
+        "bytes 2-5/10"
+    );
+    assert_eq!(head_range.headers.get("content-length").unwrap(), "4");
+
+    let unsatisfiable = http_request(address, "GET", url_path, &[("Range", "bytes=99-")]).unwrap();
+    assert_eq!(unsatisfiable.status, 416);
+    assert_eq!(
+        unsatisfiable.headers.get("content-range").unwrap(),
+        "bytes */10"
+    );
+    let head_unsatisfiable =
+        http_request(address, "HEAD", url_path, &[("Range", "bytes=99-")]).unwrap();
+    assert_eq!(head_unsatisfiable.status, 416);
+    assert!(head_unsatisfiable.body.is_empty());
+    assert_eq!(
+        head_unsatisfiable.headers.get("content-range").unwrap(),
+        "bytes */10"
+    );
+
+    for malformed in ["items=0-1", "bytes=0-1,4-5", "bytes=bad"] {
+        let response = http_request(address, "GET", url_path, &[("Range", malformed)]).unwrap();
+        assert_eq!(response.status, 200, "malformed range {malformed}");
+        assert_eq!(response.body, sample);
+    }
+
+    let if_match = http_request(address, "GET", url_path, &[("If-Match", &etag)]).unwrap();
+    assert_eq!(if_match.status, 200);
+    let if_match_list = http_request(
+        address,
+        "GET",
+        url_path,
+        &[("If-Match", &format!("\"other\", {etag}"))],
+    )
+    .unwrap();
+    assert_eq!(if_match_list.status, 200);
+    let if_match_wildcard = http_request(address, "GET", url_path, &[("If-Match", "*")]).unwrap();
+    assert_eq!(if_match_wildcard.status, 200);
+    let if_match_wrong =
+        http_request(address, "GET", url_path, &[("If-Match", "\"not-current\"")]).unwrap();
+    assert_eq!(if_match_wrong.status, 412);
+    let if_match_weak = http_request(
+        address,
+        "GET",
+        url_path,
+        &[("If-Match", &format!("W/{etag}"))],
+    )
+    .unwrap();
+    assert_eq!(if_match_weak.status, 412);
+
+    for value in [
+        etag.as_str(),
+        &format!("W/{etag}"),
+        &format!("\"other\", W/{etag}"),
+        "*",
+    ] {
+        let response = http_request(address, "GET", url_path, &[("If-None-Match", value)]).unwrap();
+        assert_eq!(response.status, 304, "If-None-Match {value}");
+        assert!(response.body.is_empty());
+        assert_eq!(response.headers.get("etag").unwrap(), &etag);
+    }
+    let if_none_then_range = http_request(
+        address,
+        "GET",
+        url_path,
+        &[("If-None-Match", &etag), ("Range", "bytes=99-")],
+    )
+    .unwrap();
+    assert_eq!(if_none_then_range.status, 304);
+    let if_match_before_range = http_request(
+        address,
+        "GET",
+        url_path,
+        &[("If-Match", "\"not-current\""), ("Range", "bytes=99-")],
+    )
+    .unwrap();
+    assert_eq!(if_match_before_range.status, 412);
+
+    let matching_if_range = http_request(
+        address,
+        "GET",
+        url_path,
+        &[("Range", "bytes=2-5"), ("If-Range", etag.as_str())],
+    )
+    .unwrap();
+    assert_eq!(matching_if_range.status, 206);
+    assert_eq!(matching_if_range.body, b"2345");
+    for if_range in [
+        "\"not-current\"",
+        &format!("W/{etag}"),
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+    ] {
+        let response = http_request(
+            address,
+            "GET",
+            url_path,
+            &[("Range", "bytes=2-5"), ("If-Range", if_range)],
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, sample);
+    }
+
+    for (name, value) in [
+        ("If-Modified-Since", "Wed, 21 Oct 2099 07:28:00 GMT"),
+        ("If-Unmodified-Since", "Wed, 21 Oct 1999 07:28:00 GMT"),
+    ] {
+        let response = http_request(address, "GET", url_path, &[(name, value)]).unwrap();
+        assert_eq!(response.status, 200, "date condition {name}");
+        assert_eq!(response.body, sample);
+    }
+
+    let empty_get = http_request(address, "GET", "/files/empty.bin", &[]).unwrap();
+    assert_eq!(empty_get.status, 200);
+    assert!(empty_get.body.is_empty());
+    assert_eq!(empty_get.headers.get("content-length").unwrap(), "0");
+    let empty_head = http_request(address, "HEAD", "/files/empty.bin", &[]).unwrap();
+    assert_eq!(empty_head.status, 200);
+    assert!(empty_head.body.is_empty());
+    let empty_range = http_request(
+        address,
+        "GET",
+        "/files/empty.bin",
+        &[("Range", "bytes=0-0")],
+    )
+    .unwrap();
+    assert_eq!(empty_range.status, 416);
+
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains("registry.example"));
+}
+
+#[tokio::test]
+async fn serve_withholds_the_final_byte_when_registry_blob_digest_fails() {
+    let registry = TestRegistry::new(false);
+    let contents = Bytes::from(vec![0x35; 1024 * 1024]);
+    let digest = Digest::from_bytes(&contents);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("corrupt.bin").unwrap(),
+        contents.clone(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let proxy = FaultProxy::corrupting_blob(&registry, &digest).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("corrupt-stream.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let response = tokio::task::spawn_blocking(move || {
+        read_http_response_partial(address, "/files/corrupt.bin")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let status = response.status;
+    let headers = response.headers;
+    let received = response.body;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-length").unwrap(),
+        &contents.len().to_string()
+    );
+    assert!(proxy.corruption_fired());
+    assert!(
+        received.len() < contents.len(),
+        "corrupt file response satisfied its declared Content-Length"
+    );
+    let stderr = stop_http_server(&mut server);
+    assert!(stderr.contains("OCI file stream failed digest/size verification or transport"));
+    assert!(!stderr.contains("555555555"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn serve_streams_large_files_with_bounded_rss_and_cancels_after_disconnect() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let total_size = 64 * 1024 * 1024_u64;
+    let chunk = Bytes::from(vec![0x5a; 64 * 1024]);
+    let chunk_count = (total_size as usize) / chunk.len();
+    let mut content_hasher = Sha256::new();
+    for _ in 0..chunk_count {
+        content_hasher.update(&chunk);
+    }
+    let digest_string = format!("sha256:{:x}", content_hasher.finalize());
+    let digest = Digest::parse(&digest_string).unwrap();
+    let source_chunk = chunk.clone();
+    let source = futures_util::stream::iter(
+        (0..chunk_count).map(move |_| Ok::<_, io::Error>(source_chunk.clone())),
+    );
+    tree.write_file_stream(
+        &StoragePath::parse_relative("large.bin").unwrap(),
+        digest.clone(),
+        total_size,
+        source,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let scratch = TempDir::new();
+    let direct_config = scratch.path.join("direct.toml");
+    fs::write(
+        &direct_config,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+            registry.base_url
+        ),
+    )
+    .unwrap();
+    let direct_address = unused_http_address();
+    let mut direct_server =
+        spawn_http_server(&direct_config, &registry.certificate, direct_address);
+    wait_for_http_server(&mut direct_server.child, direct_address);
+    let baseline_rss = process_rss_bytes(direct_server.child.id());
+    let download =
+        stream_http_response(direct_address, "/files/large.bin", direct_server.child.id()).unwrap();
+    assert_eq!(download.status, 200);
+    assert_eq!(download.bytes_read, total_size);
+    assert_eq!(download.digest, digest_string);
+    assert_eq!(
+        download.headers.get("content-length").unwrap(),
+        &total_size.to_string()
+    );
+    assert!(
+        download.peak_rss_bytes.saturating_sub(baseline_rss) < total_size / 2,
+        "server RSS grew by {} bytes while serving a {} byte blob",
+        download.peak_rss_bytes.saturating_sub(baseline_rss),
+        total_size
+    );
+    stop_http_server(&mut direct_server);
+
+    let proxy = FaultProxy::tracking_blob(&registry, &digest).await;
+    let descriptor = registry
+        .client(ClientPolicy::default())
+        .head_blob(&digest, None)
+        .await
+        .unwrap();
+    let proxy_client = proxy.registry_client(&registry);
+    let mut proxy_body = proxy_client.get_blob(&descriptor, None).await.unwrap();
+    let first_proxy_chunk = proxy_body.next().await.unwrap().unwrap();
+    assert!(!first_proxy_chunk.is_empty());
+    drop(proxy_body);
+    let proxy_probe_bytes = proxy.tracked_blob_bytes();
+    assert!(
+        proxy_probe_bytes > 0,
+        "streaming proxy did not forward blob bytes"
+    );
+
+    let proxied_config = scratch.path.join("proxied.toml");
+    fs::write(
+        &proxied_config,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+    let proxied_address = unused_http_address();
+    let mut proxied_server =
+        spawn_http_server(&proxied_config, &registry.certificate, proxied_address);
+    wait_for_http_server(&mut proxied_server.child, proxied_address);
+    let before = proxy.tracked_blob_bytes();
+    let proxy_requests_before = proxy.total_requests();
+    let proxy_accepted_before = proxy.accepted_connections();
+    let proxy_tls_before = proxy.tls_connections();
+    let tracked_requests_before = proxy.tracked_blob_requests();
+    let upstream_requests_before = registry.request_count("team/releases");
+    let disconnect_result = tokio::task::spawn_blocking(move || {
+        disconnect_http_response(proxied_address, "/files/large.bin")
+    })
+    .await
+    .unwrap();
+    let (status, headers, client_received) = match disconnect_result {
+        Ok(response) => response,
+        Err(error) => {
+            let server_logs = stop_http_server(&mut proxied_server);
+            panic!(
+                "could not receive first proxied response body chunk: {error}; proxy accepted={} TLS={} requests={} (tracked={}); proxy forwarded {} bytes; upstream registry requests delta={}; server logs: {server_logs}",
+                proxy
+                    .accepted_connections()
+                    .saturating_sub(proxy_accepted_before),
+                proxy.tls_connections().saturating_sub(proxy_tls_before),
+                proxy.total_requests().saturating_sub(proxy_requests_before),
+                proxy
+                    .tracked_blob_requests()
+                    .saturating_sub(tracked_requests_before),
+                proxy.tracked_blob_bytes().saturating_sub(before),
+                registry
+                    .request_count("team/releases")
+                    .saturating_sub(upstream_requests_before)
+            );
+        }
+    };
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-length").unwrap(),
+        &total_size.to_string()
+    );
+    assert!(client_received > 0 && (client_received as u64) < total_size);
+    wait_for_proxy_blob_bytes(&proxy, before + client_received as u64).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let settled = proxy.tracked_blob_bytes();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after = proxy.tracked_blob_bytes();
+    assert!(
+        after.saturating_sub(settled) < 1024 * 1024,
+        "upstream blob continued streaming after the client disconnected"
+    );
+    assert!(
+        after.saturating_sub(before) < total_size / 2,
+        "disconnect consumed too much of the upstream blob"
+    );
+    let stderr = stop_http_server(&mut proxied_server);
+    assert!(!stderr.contains("registry.example"));
+}
+
+#[tokio::test]
+async fn serve_maps_a_stopped_registry_to_service_unavailable() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("available.txt").unwrap(),
+        Bytes::from_static(b"stored before registry stopped"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("stopped-registry.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+            registry.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let stopped = Command::new("docker")
+        .args(["stop", "--time", "1", &registry.container])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "could not stop test registry");
+    let response = http_request(address, "GET", "/files/available.txt", &[]).unwrap();
+    assert_eq!(response.status, 503);
+    assert_eq!(response.body, b"service unavailable\n");
+    assert!(!String::from_utf8_lossy(&response.body).contains("127.0.0.1"));
+    stop_http_server(&mut server);
+}
+
+#[tokio::test]
 async fn tree_concurrent_writers_and_pinned_listing_cursor_preserve_snapshots() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -1212,6 +1730,155 @@ fn http_request(
     })
 }
 
+#[cfg(target_os = "linux")]
+struct PartialHttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_http_response_partial(
+    address: SocketAddr,
+    target: &str,
+) -> io::Result<PartialHttpResponse> {
+    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(
+        socket,
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut reader = BufReader::new(socket);
+    let (status, headers) = read_http_response_head(&mut reader)?;
+    let mut body = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => body.extend_from_slice(&buffer[..count]),
+        }
+    }
+    Ok(PartialHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn read_http_response_head(
+    reader: &mut BufReader<TcpStream>,
+) -> io::Result<(u16, HashMap<String, String>)> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| io::Error::other("HTTP response status was malformed"))?;
+    let mut headers = HashMap::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io::Error::other("HTTP response ended before its headers"));
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+    Ok((status, headers))
+}
+
+#[cfg(target_os = "linux")]
+struct StreamedHttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    bytes_read: u64,
+    digest: String,
+    peak_rss_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_rss_bytes(pid: u32) -> u64 {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let resident = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    resident * 1024
+}
+
+#[cfg(target_os = "linux")]
+fn stream_http_response(
+    address: SocketAddr,
+    target: &str,
+    pid: u32,
+) -> io::Result<StreamedHttpResponse> {
+    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    write!(
+        socket,
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut reader = BufReader::new(socket);
+    let (status, headers) = read_http_response_head(&mut reader)?;
+    let mut remaining = headers
+        .get("content-length")
+        .ok_or_else(|| io::Error::other("streamed HTTP response omitted Content-Length"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("streamed HTTP Content-Length was invalid"))?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut received = 0_u64;
+    let mut peak_rss_bytes = process_rss_bytes(pid);
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        let count = reader.read(&mut buffer[..limit])?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        received += count as u64;
+        remaining -= count as u64;
+        peak_rss_bytes = peak_rss_bytes.max(process_rss_bytes(pid));
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(StreamedHttpResponse {
+        status,
+        headers,
+        bytes_read: received,
+        digest: format!("sha256:{:x}", hasher.finalize()),
+        peak_rss_bytes,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn disconnect_http_response(
+    address: SocketAddr,
+    target: &str,
+) -> io::Result<(u16, HashMap<String, String>, usize)> {
+    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(
+        socket,
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut reader = BufReader::new(socket);
+    let (status, headers) = read_http_response_head(&mut reader)
+        .map_err(|error| io::Error::other(format!("reading response headers: {error}")))?;
+    let mut first_chunk = vec![0_u8; 64 * 1024];
+    let count = reader
+        .read(&mut first_chunk)
+        .map_err(|error| io::Error::other(format!("reading first body chunk: {error}")))?;
+    Ok((status, headers, count))
+}
+
 struct RunningHttpServer {
     child: Child,
     stopped: bool,
@@ -1308,6 +1975,21 @@ fn wait_for_registry_requests(registry: &TestRegistry, repository: &str, minimum
             "registry {repository} logged {count} matching requests; expected at least {minimum}"
         );
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_for_proxy_blob_bytes(proxy: &FaultProxy, minimum: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = proxy.tracked_blob_bytes();
+        if count >= minimum {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy forwarded {count} tracked blob bytes; expected at least {minimum}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1479,6 +2161,14 @@ enum CommitFault {
 struct FaultState {
     mode: CommitFault,
     root_path: String,
+    tracked_blob_path: Option<String>,
+    corrupt_tracked_blob: bool,
+    corruption_fired: AtomicBool,
+    accepted_connections: AtomicUsize,
+    tls_connections: AtomicUsize,
+    tracked_blob_requests: AtomicUsize,
+    tracked_blob_bytes: AtomicU64,
+    total_requests: AtomicUsize,
     fault_fired: AtomicBool,
     root_put_attempts: AtomicUsize,
     root_put_forwarded: AtomicUsize,
@@ -1492,6 +2182,25 @@ struct FaultProxy {
 
 impl FaultProxy {
     async fn new(registry: &TestRegistry, mode: CommitFault) -> Self {
+        Self::new_with_tracked_blob(registry, mode, None, false).await
+    }
+
+    async fn tracking_blob(registry: &TestRegistry, digest: &Digest) -> Self {
+        let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
+        Self::new_with_tracked_blob(registry, CommitFault::BeforeCommit, Some(path), false).await
+    }
+
+    async fn corrupting_blob(registry: &TestRegistry, digest: &Digest) -> Self {
+        let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
+        Self::new_with_tracked_blob(registry, CommitFault::BeforeCommit, Some(path), true).await
+    }
+
+    async fn new_with_tracked_blob(
+        registry: &TestRegistry,
+        mode: CommitFault,
+        tracked_blob_path: Option<String>,
+        corrupt_tracked_blob: bool,
+    ) -> Self {
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
         let key_der = certificates.join("localhost-key.der");
@@ -1545,6 +2254,14 @@ impl FaultProxy {
                 "/v2/{}/manifests/{}",
                 registry.mount.repository, registry.mount.root_tag
             ),
+            tracked_blob_path,
+            corrupt_tracked_blob,
+            corruption_fired: AtomicBool::new(false),
+            accepted_connections: AtomicUsize::new(0),
+            tls_connections: AtomicUsize::new(0),
+            tracked_blob_requests: AtomicUsize::new(0),
+            tracked_blob_bytes: AtomicU64::new(0),
+            total_requests: AtomicUsize::new(0),
             fault_fired: AtomicBool::new(false),
             root_put_attempts: AtomicUsize::new(0),
             root_put_forwarded: AtomicUsize::new(0),
@@ -1558,6 +2275,7 @@ impl FaultProxy {
                     let Ok((stream, _)) = listener.accept().await else {
                         return;
                     };
+                    state.accepted_connections.fetch_add(1, Ordering::SeqCst);
                     let acceptor = acceptor.clone();
                     let upstream = upstream.clone();
                     let proxy_origin = proxy_origin.clone();
@@ -1567,6 +2285,7 @@ impl FaultProxy {
                         let Ok(stream) = acceptor.accept(stream).await else {
                             return;
                         };
+                        state.tls_connections.fetch_add(1, Ordering::SeqCst);
                         let service = service_fn(move |request| {
                             let upstream = upstream.clone();
                             let proxy_origin = proxy_origin.clone();
@@ -1578,7 +2297,7 @@ impl FaultProxy {
                                     &upstream,
                                     &proxy_origin,
                                     &client,
-                                    &state,
+                                    state,
                                 )
                                 .await
                             }
@@ -1595,6 +2314,30 @@ impl FaultProxy {
             state,
             task,
         }
+    }
+
+    fn tracked_blob_bytes(&self) -> u64 {
+        self.state.tracked_blob_bytes.load(Ordering::SeqCst)
+    }
+
+    fn accepted_connections(&self) -> usize {
+        self.state.accepted_connections.load(Ordering::SeqCst)
+    }
+
+    fn tls_connections(&self) -> usize {
+        self.state.tls_connections.load(Ordering::SeqCst)
+    }
+
+    fn total_requests(&self) -> usize {
+        self.state.total_requests.load(Ordering::SeqCst)
+    }
+
+    fn tracked_blob_requests(&self) -> usize {
+        self.state.tracked_blob_requests.load(Ordering::SeqCst)
+    }
+
+    fn corruption_fired(&self) -> bool {
+        self.state.corruption_fired.load(Ordering::SeqCst)
     }
 
     fn registry_client(&self, registry: &TestRegistry) -> RegistryClient {
@@ -1620,8 +2363,8 @@ async fn proxy_registry_request(
     upstream: &str,
     proxy_origin: &str,
     client: &reqwest::Client,
-    state: &FaultState,
-) -> Result<Response<Full<Bytes>>, io::Error> {
+    state: Arc<FaultState>,
+) -> Result<Response<AxumBody>, io::Error> {
     let is_root_put =
         request.method() == reqwest::Method::PUT && request.uri().path() == state.root_path;
     let mut inject_fault = false;
@@ -1637,6 +2380,12 @@ async fn proxy_registry_request(
     }
 
     let (parts, body) = request.into_parts();
+    state.total_requests.fetch_add(1, Ordering::SeqCst);
+    let tracked_blob = parts.method == reqwest::Method::GET
+        && state.tracked_blob_path.as_deref() == Some(parts.uri.path());
+    if tracked_blob {
+        state.tracked_blob_requests.fetch_add(1, Ordering::SeqCst);
+    }
     let body = body
         .collect()
         .await
@@ -1670,10 +2419,6 @@ async fn proxy_registry_request(
     }
     let status = response.status();
     let response_headers = response.headers().clone();
-    let response_body = response
-        .bytes()
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?;
 
     if inject_fault && matches!(state.mode, CommitFault::AfterCommit) && status.is_success() {
         return Err(io::Error::new(
@@ -1682,6 +2427,35 @@ async fn proxy_registry_request(
         ));
     }
 
+    let metrics = Arc::clone(&state);
+    let corrupt_tracked_blob = tracked_blob && state.corrupt_tracked_blob;
+    let response_body = response
+        .bytes_stream()
+        .map(move |result| match result {
+            Ok(mut bytes) => {
+                if tracked_blob {
+                    metrics
+                        .tracked_blob_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                }
+                if corrupt_tracked_blob
+                    && !metrics.corruption_fired.swap(true, Ordering::SeqCst)
+                    && !bytes.is_empty()
+                {
+                    let mut corrupted = bytes.to_vec();
+                    corrupted[0] ^= 0x01;
+                    bytes = Bytes::from(corrupted);
+                }
+                Ok(bytes)
+            }
+            Err(error) => Err(io::Error::other(error.to_string())),
+        })
+        .then(move |chunk| async move {
+            if tracked_blob && chunk.is_ok() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            chunk
+        });
     let mut output = Response::builder().status(status);
     for (name, value) in &response_headers {
         if matches!(name.as_str(), "connection" | "transfer-encoding") {
@@ -1702,7 +2476,7 @@ async fn proxy_registry_request(
         output = output.header(name, value);
     }
     output
-        .body(Full::new(response_body))
+        .body(AxumBody::from_stream(response_body))
         .map_err(|error| io::Error::other(error.to_string()))
 }
 
