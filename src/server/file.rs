@@ -411,26 +411,50 @@ fn if_range_matches(headers: &HeaderMap, etag: &str) -> bool {
     if values.next().is_some() {
         return false;
     }
-    match parse_entity_tag_condition_bytes(value.as_bytes()) {
-        Some(EntityTagCondition::Tags(tags)) if tags.len() == 1 => {
-            let tag = &tags[0];
-            !tag.weak && tag.opaque.as_slice() == etag_opaque(etag).as_bytes()
-        }
-        _ => false,
+    parse_single_entity_tag(value.as_bytes())
+        .is_some_and(|tag| !tag.weak && tag.opaque.as_slice() == etag_opaque(etag).as_bytes())
+}
+
+fn parse_single_entity_tag(bytes: &[u8]) -> Option<EntityTag> {
+    if bytes.len() > MAX_CONDITIONAL_HEADER_BYTES {
+        return None;
     }
+    let mut index = skip_optional_whitespace(bytes, 0);
+    let weak = bytes.get(index..index + 2) == Some(b"W/");
+    if weak {
+        index += 2;
+    }
+    if bytes.get(index) != Some(&b'\"') {
+        return None;
+    }
+    index += 1;
+    let start = index;
+    while index < bytes.len() && bytes[index] != b'\"' {
+        let byte = bytes[index];
+        if byte != 0x21 && !(0x23..=0x7e).contains(&byte) && byte < 0x80 {
+            return None;
+        }
+        index += 1;
+    }
+    if index == bytes.len() {
+        return None;
+    }
+    let opaque = bytes[start..index].to_vec();
+    index = skip_optional_whitespace(bytes, index + 1);
+    (index == bytes.len()).then_some(EntityTag { weak, opaque })
 }
 
 fn parse_byte_range(value: &str, size: u64) -> Option<ParsedRange> {
     let (unit, value) = value.trim().split_once('=')?;
-    if !unit.trim().eq_ignore_ascii_case("bytes") || value.contains(',') {
+    if !unit.eq_ignore_ascii_case("bytes") || value.contains(',') {
         return None;
     }
-    let (first, last) = value.trim().split_once('-')?;
+    let (first, last) = value.split_once('-')?;
     if last.contains('-') {
         return None;
     }
     if first.is_empty() {
-        let suffix = last.trim().parse::<u64>().ok()?;
+        let suffix = last.parse::<u64>().ok()?;
         if suffix == 0 || size == 0 {
             return Some(ParsedRange::Unsatisfiable);
         }
@@ -441,16 +465,16 @@ fn parse_byte_range(value: &str, size: u64) -> Option<ParsedRange> {
         }));
     }
 
-    let start = first.trim().parse::<u64>().ok()?;
+    let start = first.parse::<u64>().ok()?;
     if size == 0 || start >= size {
         return Some(ParsedRange::Unsatisfiable);
     }
-    let end = if last.trim().is_empty() {
+    let end = if last.is_empty() {
         size - 1
     } else {
-        let end = last.trim().parse::<u64>().ok()?;
+        let end = last.parse::<u64>().ok()?;
         if end < start {
-            return Some(ParsedRange::Unsatisfiable);
+            return None;
         }
         end.min(size - 1)
     };
@@ -613,10 +637,9 @@ mod tests {
             parse_byte_range("bytes=10-", 10),
             Some(ParsedRange::Unsatisfiable)
         );
-        assert_eq!(
-            parse_byte_range("bytes=5-2", 10),
-            Some(ParsedRange::Unsatisfiable)
-        );
+        assert_eq!(parse_byte_range("bytes=5-2", 10), None);
+        assert_eq!(parse_byte_range("bytes=0 -1", 10), None);
+        assert_eq!(parse_byte_range("bytes=0- 1", 10), None);
         assert_eq!(
             parse_byte_range("bytes=-0", 10),
             Some(ParsedRange::Unsatisfiable)
@@ -677,6 +700,11 @@ mod tests {
             select_range(&headers, 10, etag),
             RangeSelection::Partial(ByteRange { start: 0, end: 1 })
         );
+        headers.insert(
+            header::IF_RANGE,
+            HeaderValue::from_str(&format!("{etag},")).unwrap(),
+        );
+        assert_eq!(select_range(&headers, 10, etag), RangeSelection::Full);
     }
 
     #[tokio::test]

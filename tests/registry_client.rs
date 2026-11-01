@@ -982,7 +982,13 @@ repository = "team/releases"
         "bytes */10"
     );
 
-    for malformed in ["items=0-1", "bytes=0-1,4-5", "bytes=bad"] {
+    for malformed in [
+        "items=0-1",
+        "bytes=0-1,4-5",
+        "bytes=bad",
+        "bytes=5-2",
+        "bytes=0 -1",
+    ] {
         let response = http_request(address, "GET", url_path, &[("Range", malformed)]).unwrap();
         assert_eq!(response.status, 200, "malformed range {malformed}");
         assert_eq!(response.body, sample);
@@ -1154,6 +1160,59 @@ repository = "team/releases"
     let stderr = stop_http_server(&mut server);
     assert!(stderr.contains("OCI file stream failed digest/size verification or transport"));
     assert!(!stderr.contains("555555555"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn serve_relays_only_valid_retry_after_values_on_rate_limits() {
+    let registry = TestRegistry::new(false);
+    for (retry_after, expected) in [
+        (Some("120"), Some("120")),
+        (
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        ),
+        (Some("not-a-date"), None),
+        (None, None),
+    ] {
+        let proxy = FaultProxy::rate_limited(&registry, retry_after).await;
+        let scratch = TempDir::new();
+        let config_path = scratch.path.join("rate-limit.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"version = 1
+
+[[mounts]]
+name = "files"
+prefix = "/files"
+registry = "{}"
+repository = "team/releases"
+"#,
+                proxy.base_url
+            ),
+        )
+        .unwrap();
+        let address = unused_http_address();
+        let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+        wait_for_http_server(&mut server.child, address);
+
+        let response = tokio::task::spawn_blocking(move || {
+            http_request(address, "GET", "/files/anything", &[])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body, b"service unavailable\n");
+        assert_eq!(
+            response.headers.get("retry-after").map(String::as_str),
+            expected
+        );
+        assert!(!String::from_utf8_lossy(&response.body).contains("127.0.0.1"));
+        stop_http_server(&mut server);
+        drop(proxy);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2164,6 +2223,8 @@ struct FaultState {
     tracked_blob_path: Option<String>,
     corrupt_tracked_blob: bool,
     corruption_fired: AtomicBool,
+    rate_limit_path: Option<String>,
+    rate_limit_after: Option<HeaderValue>,
     accepted_connections: AtomicUsize,
     tls_connections: AtomicUsize,
     tracked_blob_requests: AtomicUsize,
@@ -2182,17 +2243,49 @@ struct FaultProxy {
 
 impl FaultProxy {
     async fn new(registry: &TestRegistry, mode: CommitFault) -> Self {
-        Self::new_with_tracked_blob(registry, mode, None, false).await
+        Self::new_with_tracked_blob(registry, mode, None, false, None, None).await
     }
 
     async fn tracking_blob(registry: &TestRegistry, digest: &Digest) -> Self {
         let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
-        Self::new_with_tracked_blob(registry, CommitFault::BeforeCommit, Some(path), false).await
+        Self::new_with_tracked_blob(
+            registry,
+            CommitFault::BeforeCommit,
+            Some(path),
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn corrupting_blob(registry: &TestRegistry, digest: &Digest) -> Self {
         let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
-        Self::new_with_tracked_blob(registry, CommitFault::BeforeCommit, Some(path), true).await
+        Self::new_with_tracked_blob(
+            registry,
+            CommitFault::BeforeCommit,
+            Some(path),
+            true,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn rate_limited(registry: &TestRegistry, retry_after: Option<&'static str>) -> Self {
+        let path = format!(
+            "/v2/{}/manifests/{}",
+            registry.mount.repository, registry.mount.root_tag
+        );
+        Self::new_with_tracked_blob(
+            registry,
+            CommitFault::BeforeCommit,
+            None,
+            false,
+            Some(path),
+            retry_after.map(HeaderValue::from_static),
+        )
+        .await
     }
 
     async fn new_with_tracked_blob(
@@ -2200,6 +2293,8 @@ impl FaultProxy {
         mode: CommitFault,
         tracked_blob_path: Option<String>,
         corrupt_tracked_blob: bool,
+        rate_limit_path: Option<String>,
+        rate_limit_after: Option<HeaderValue>,
     ) -> Self {
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
@@ -2257,6 +2352,8 @@ impl FaultProxy {
             tracked_blob_path,
             corrupt_tracked_blob,
             corruption_fired: AtomicBool::new(false),
+            rate_limit_path,
+            rate_limit_after,
             accepted_connections: AtomicUsize::new(0),
             tls_connections: AtomicUsize::new(0),
             tracked_blob_requests: AtomicUsize::new(0),
@@ -2381,6 +2478,17 @@ async fn proxy_registry_request(
 
     let (parts, body) = request.into_parts();
     state.total_requests.fetch_add(1, Ordering::SeqCst);
+    if parts.method == reqwest::Method::HEAD
+        && state.rate_limit_path.as_deref() == Some(parts.uri.path())
+    {
+        let mut response = Response::builder().status(reqwest::StatusCode::TOO_MANY_REQUESTS);
+        if let Some(retry_after) = &state.rate_limit_after {
+            response = response.header(reqwest::header::RETRY_AFTER, retry_after.clone());
+        }
+        return response
+            .body(AxumBody::from("rate limited\\n"))
+            .map_err(|error| io::Error::other(error.to_string()));
+    }
     let tracked_blob = parts.method == reqwest::Method::GET
         && state.tracked_blob_path.as_deref() == Some(parts.uri.path());
     if tracked_blob {

@@ -217,6 +217,15 @@ fn directory_not_implemented(method: Method) -> Response {
 }
 
 fn tree_error_response(error: TreeError) -> Response {
+    let retry_after = match &error {
+        TreeError::Registry(error)
+            if error.kind == ErrorKind::RateLimited
+                && error.retry_after.as_ref().is_some_and(valid_retry_after) =>
+        {
+            error.retry_after.clone()
+        }
+        _ => None,
+    };
     let (status, message) = match &error {
         TreeError::InvalidPath => (StatusCode::BAD_REQUEST, "invalid path\n"),
         TreeError::NotFound => (StatusCode::NOT_FOUND, "not found\n"),
@@ -237,7 +246,21 @@ fn tree_error_response(error: TreeError) -> Response {
         _ => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
     };
     warn!(%status, %error, "OCI-backed request failed");
-    error_response(status, message)
+    let mut response = error_response(status, message);
+    if let Some(retry_after) = retry_after {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, retry_after);
+    }
+    response
+}
+
+fn valid_retry_after(value: &axum::http::HeaderValue) -> bool {
+    let bytes = value.as_bytes();
+    (!bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit))
+        || value
+            .to_str()
+            .is_ok_and(|date| httpdate::parse_http_date(date).is_ok())
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response {
@@ -299,4 +322,41 @@ async fn shutdown_signal() {
     }
 
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderValue, StatusCode};
+
+    use super::*;
+    use oci_auto_http::registry::RegistryError;
+
+    fn rate_limit_error(retry_after: Option<&'static str>) -> TreeError {
+        TreeError::Registry(RegistryError {
+            kind: ErrorKind::RateLimited,
+            status: Some(StatusCode::TOO_MANY_REQUESTS),
+            challenges: Vec::new(),
+            retry_after: retry_after.map(HeaderValue::from_static),
+            challenge_relay_allowed: true,
+        })
+    }
+
+    #[test]
+    fn relays_only_valid_retry_after_values_on_rate_limit_responses() {
+        for value in ["120", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+            let response = tree_error_response(rate_limit_error(Some(value)));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], value);
+        }
+
+        for value in ["", "soon", "-1", "1.5"] {
+            let response = tree_error_response(rate_limit_error(Some(value)));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key(header::RETRY_AFTER));
+        }
+
+        let response = tree_error_response(rate_limit_error(None));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
 }
