@@ -1,3 +1,5 @@
+mod file;
+
 use std::{
     fs::File,
     io::{self, Read},
@@ -9,18 +11,16 @@ use axum::{
     Router,
     body::Body,
     extract::{OriginalUri, State},
-    http::{Method, Request, StatusCode, header},
+    http::{HeaderMap, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::Response,
     routing::get,
 };
-use bytes::Bytes;
-use futures_util::{Stream, StreamExt, stream};
 use oci_auto_http::{
     config::{Config, ResolvedPath},
     error::AppError,
     registry::{ClientPolicy, ErrorKind, RegistryClient},
-    tree::{TreeError, TreeFile, TreeStore},
+    tree::{TreeError, TreeStore},
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -80,14 +80,17 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
 }
 
 async fn reject_cleartext_authorization(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
     let mut authorization = request.headers().get_all(header::AUTHORIZATION).iter();
     if authorization.next().is_some() {
-        if authorization.next().is_some() {
-            return error_response(StatusCode::BAD_REQUEST, "invalid request\n");
-        }
-        // This listener currently accepts cleartext HTTP only. Never forward a
-        // credential or relay its challenge across an untrusted cleartext hop.
-        return error_response(StatusCode::FORBIDDEN, "forbidden\n");
+        let response = if authorization.next().is_some() {
+            error_response(StatusCode::BAD_REQUEST, "invalid request\n")
+        } else {
+            // This listener currently accepts cleartext HTTP only. Never forward a
+            // credential or relay its challenge across an untrusted cleartext hop.
+            error_response(StatusCode::FORBIDDEN, "forbidden\n")
+        };
+        return bodyless_for_head(&method, response);
     }
     next.run(request).await
 }
@@ -100,6 +103,22 @@ async fn route_request(
     State(state): State<Arc<ServeState>>,
     method: Method,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    let is_head = method == Method::HEAD;
+    let response = route_request_inner(state, method, uri, headers).await;
+    if is_head {
+        response.map(|_| Body::empty())
+    } else {
+        response
+    }
+}
+
+async fn route_request_inner(
+    state: Arc<ServeState>,
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
 ) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return method_not_allowed();
@@ -130,7 +149,7 @@ async fn route_request(
 
     if method == Method::HEAD {
         return match store.stat_file(&resolved.storage_path, None).await {
-            Ok(descriptor) => file_response(descriptor.size, Body::empty()),
+            Ok(descriptor) => file::head_response(&descriptor, &resolved.storage_path, &headers),
             Err(TreeError::IsDirectory) => {
                 match store.list_page(&resolved.storage_path, 1, None, None).await {
                     Ok(_) => permanent_redirect(&resolved),
@@ -142,7 +161,7 @@ async fn route_request(
     }
 
     match store.read_file(&resolved.storage_path, None).await {
-        Ok(file) => file_response_for_get(file).await,
+        Ok(file) => file::get_response(file, &resolved.storage_path, &headers).await,
         Err(TreeError::IsDirectory) => {
             match store.list_page(&resolved.storage_path, 1, None, None).await {
                 Ok(_) => permanent_redirect(&resolved),
@@ -150,6 +169,14 @@ async fn route_request(
             }
         }
         Err(error) => tree_error_response(error),
+    }
+}
+
+fn bodyless_for_head(method: &Method, response: Response) -> Response {
+    if method == Method::HEAD {
+        response.map(|_| Body::empty())
+    } else {
+        response
     }
 }
 
@@ -188,66 +215,6 @@ fn directory_not_implemented(method: Method) -> Response {
         .expect("static directory response headers are valid")
 }
 
-async fn file_response_for_get(file: TreeFile) -> Response {
-    let size = file.descriptor.size;
-    if size == 0 {
-        let mut body = file.body;
-        while let Some(chunk) = body.next().await {
-            match chunk {
-                Ok(bytes) if bytes.is_empty() => {}
-                Ok(_) => return tree_error_response(TreeError::IntegrityError),
-                Err(error) => return tree_error_response(error),
-            }
-        }
-        return file_response(size, Body::empty());
-    }
-    file_response(size, Body::from_stream(withhold_final_chunk(file.body)))
-}
-
-fn withhold_final_chunk(
-    body: impl Stream<Item = Result<Bytes, TreeError>> + Unpin + Send + 'static,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
-    stream::unfold(
-        (body, None, false),
-        |(mut body, mut held, done)| async move {
-            if done {
-                return None;
-            }
-            loop {
-                match body.next().await {
-                    Some(Ok(bytes)) if bytes.is_empty() => continue,
-                    Some(Ok(bytes)) => {
-                        if let Some(previous) = held.replace(bytes) {
-                            return Some((Ok(previous), (body, held, false)));
-                        }
-                    }
-                    Some(Err(_)) => {
-                        return Some((
-                            Err(io::Error::other("verified OCI content stream failed")),
-                            (body, None, true),
-                        ));
-                    }
-                    None => {
-                        return held.map(|last| (Ok(last), (body, None, true)));
-                    }
-                }
-            }
-        },
-    )
-}
-
-fn file_response(size: u64, body: Body) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::CACHE_CONTROL, "private, no-store")
-        .header(header::VARY, "Authorization")
-        .body(body)
-        .expect("static file response headers are valid")
-}
-
 fn tree_error_response(error: TreeError) -> Response {
     let (status, message) = match &error {
         TreeError::InvalidPath => (StatusCode::BAD_REQUEST, "invalid path\n"),
@@ -276,6 +243,7 @@ fn error_response(status: StatusCode, message: &'static str) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, message.len().to_string())
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::VARY, "Authorization")
         .body(Body::from(message))
