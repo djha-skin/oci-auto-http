@@ -100,6 +100,25 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
         String::from_utf8_lossy(&filtered.stderr)
             .contains("error: artifact create is not available yet")
     );
+
+    let json = Command::new(binary())
+        .args(["--log-format", "json", "artifact", "create", "sample"])
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(69));
+    let stderr = String::from_utf8(json.stderr).unwrap();
+    let lines: Vec<_> = stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "JSON mode must emit one record: {stderr}");
+    let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(record["level"], "ERROR");
+    assert_eq!(record["fields"]["exit_code"], 69);
+    assert!(
+        record["fields"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no registry request was made")
+    );
 }
 
 #[test]
