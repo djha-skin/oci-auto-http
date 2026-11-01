@@ -824,6 +824,9 @@ impl RegistryClient {
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| RegistryError::new(ErrorKind::InvalidResponse))?;
+            if raw_url_reference_has_userinfo(location) {
+                return Err(RegistryError::new(ErrorKind::RedirectDenied));
+            }
             url = url
                 .join(location)
                 .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))?;
@@ -1159,8 +1162,26 @@ fn response_location(response: &Response, base: &Url) -> Result<Url, RegistryErr
         .ok_or_else(|| RegistryError::new(ErrorKind::InvalidResponse))?
         .to_str()
         .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))?;
+    if raw_url_reference_has_userinfo(location) {
+        return Err(RegistryError::new(ErrorKind::RedirectDenied));
+    }
     base.join(location)
         .map_err(|_| RegistryError::new(ErrorKind::InvalidResponse))
+}
+
+fn raw_url_reference_has_userinfo(value: &str) -> bool {
+    let authority_and_path = value
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .or_else(|| value.strip_prefix("//"))
+        .or_else(|| {
+            let (scheme, remainder) = value.split_once(':')?;
+            matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+                .then_some(remainder.trim_start_matches('/'))
+        });
+    authority_and_path
+        .and_then(|remainder| remainder.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 fn response_error(response: &Response) -> RegistryError {
@@ -1670,6 +1691,26 @@ mod tests {
         assert!(!client.should_forward_authorization(
             &Url::parse("https://cdn.example/v2?signature=secret").unwrap()
         ));
+    }
+
+    #[test]
+    fn raw_url_references_reject_empty_and_nonempty_userinfo_authorities() {
+        for value in [
+            "https://@registry.example/path",
+            "https://user@registry.example/path",
+            "https:@registry.example/path",
+            "https:/@registry.example/path",
+            "//@cdn.example/object",
+        ] {
+            assert!(raw_url_reference_has_userinfo(value), "{value}");
+        }
+        for value in [
+            "uploads/session@opaque",
+            "https://registry.example/path@opaque",
+            "https://registry.example/?return=@opaque",
+        ] {
+            assert!(!raw_url_reference_has_userinfo(value), "{value}");
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ The HTTP listener is read-only. It supports `GET` and `HEAD`; artifact mutation 
 
 Each configured mount has a canonical absolute URL-path prefix. Prefixes are compared on decoded path-component boundaries, not as arbitrary string prefixes: `/pkg` matches `/pkg` and `/pkg/a`, but not `/pkg-old`. Mount configuration MUST reject duplicate or overlapping prefixes before the listener starts; `/` is permitted only as the sole mount. The selected mount is fixed for the whole request. No failed lookup may fall through to another mount. A path outside every mount returns `404`.
 
-The request target MUST be origin-form. The listener validates and decodes the escaped path exactly once under ADR 0001 before storage lookup. Invalid paths, ambiguous separators, malformed escapes, or excessive lengths return `400`; they MUST NOT cause registry access. The query string is not part of storage identity, is ignored for file and directory lookup, is never forwarded upstream, is omitted from generated links and redirects, and MUST NOT be logged. A fragment is not part of an HTTP request target.
+The request target MUST be origin-form. The listener validates and decodes the escaped path exactly once under ADR 0001 before storage lookup. Invalid paths, ambiguous separators, malformed escapes, or excessive lengths return `400`; they MUST NOT cause registry access. The listener accepts at most 64 request header fields and 16 KiB total header-name/value bytes; larger requests return generic `431` before route/registry work. Since the service is read-only, `GET` and `HEAD` requests MUST NOT carry a body: non-zero `Content-Length` or any `Transfer-Encoding` returns generic `400` without registry access (`Content-Length: 0` is allowed). The query string is not part of storage identity, is ignored for file and directory lookup, is never forwarded upstream, is omitted from generated links and redirects, and MUST NOT be logged. A fragment is not part of an HTTP request target.
 
 The empty relative path denotes the mount root. The mount root and every directory have canonical URLs ending in `/`. A `GET` or `HEAD` for a known directory without its trailing slash returns `301 Moved Permanently` with a `Location` made from the canonical encoded path plus `/`; the original query is not copied. A file requested with a trailing slash, or a missing file/directory, returns `404`. Directory existence is determined from the ADR 0001 tree, not guessed from an OCI error.
 
@@ -69,7 +69,8 @@ For a `401` from the configured HTTPS registry origin on a secure client connect
 
 | Condition | HTTP response |
 | --- | --- |
-| Invalid/ambiguous/over-limit path (`InvalidPath`) | `400 Bad Request`; no registry access. |
+| Invalid/ambiguous/over-limit path (`InvalidPath`) or non-empty request body | `400 Bad Request`; no registry access. |
+| Request header field count/bytes exceed configured implementation limits | `431 Request Header Fields Too Large`; no registry access. |
 | No mount or no logical path in the tree | `404 Not Found`; generic body. |
 | Known directory requested without `/` | `301` with canonical encoded `Location`. |
 | Unsupported method | `405`, `Allow: GET, HEAD`; no registry access. |

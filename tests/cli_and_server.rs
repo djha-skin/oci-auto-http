@@ -705,6 +705,47 @@ fn malformed_ambiguous_and_unsafe_configs_fail_before_listening() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn serve_rejects_request_bodies_and_oversized_headers() {
+    let address = unused_loopback_address();
+    let mut server = spawn_server(address);
+    let health = request_until_ready(&mut server.child, address, "GET", "/healthz");
+    assert!(health.starts_with("HTTP/1.1 204"), "{health}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let body = client
+        .get(format!("http://{address}/packages/file"))
+        .body("unexpected request body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(body.text().await.unwrap(), "invalid request\n");
+
+    let oversized = reqwest::header::HeaderValue::from_bytes(&vec![b'a'; 16 * 1024 + 1]).unwrap();
+    let headers_too_large = client
+        .get(format!("http://{address}/packages/file"))
+        .header("x-padding", oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        headers_too_large.status(),
+        reqwest::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+    );
+    assert_eq!(
+        headers_too_large.text().await.unwrap(),
+        "request headers too large\n"
+    );
+    let stderr = stop_server(&mut server);
+    assert!(!stderr.contains("unexpected request body"));
+    assert!(!stderr.contains("x-padding"));
+}
+
+#[cfg(unix)]
 #[test]
 fn valid_multiple_mounts_load_without_local_content_state() {
     let temp = TempDir::new();
@@ -801,6 +842,15 @@ fn serve_runs_a_real_listener_and_shuts_down_on_sigterm() {
     let fallback = request_until_ready(&mut server.child, address, "GET", "/");
     assert!(fallback.starts_with("HTTP/1.1 404"), "{fallback}");
     assert!(fallback.contains("not found"));
+
+    let absolute_form = request_until_ready(
+        &mut server.child,
+        address,
+        "GET",
+        "http://attacker.example/packages/file",
+    );
+    assert!(absolute_form.starts_with("HTTP/1.1 400"), "{absolute_form}");
+    assert!(!absolute_form.contains("attacker.example"));
 
     let invalid = request_until_ready(&mut server.child, address, "GET", "/packages/%2Fsecret");
     assert!(invalid.starts_with("HTTP/1.1 400"), "{invalid}");

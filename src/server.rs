@@ -46,6 +46,8 @@ const MAX_CA_CERT_BYTES: u64 = 1024 * 1024;
 const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
 const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REQUEST_HEADER_FIELDS: usize = 64;
+const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct ServeState {
@@ -245,6 +247,15 @@ async fn enforce_authorization_transport(
     next: Next,
 ) -> Response {
     let method = request.method().clone();
+    if request.uri().scheme().is_some()
+        || request.uri().authority().is_some()
+        || !request.uri().path().starts_with('/')
+    {
+        return bodyless_for_head(
+            &method,
+            error_response(StatusCode::BAD_REQUEST, "invalid request\n"),
+        );
+    }
     let mut authorization = request.headers().get_all(header::AUTHORIZATION).iter();
     if authorization.next().is_some() {
         let response = if authorization.next().is_some() {
@@ -253,11 +264,75 @@ async fn enforce_authorization_transport(
             // Never forward caller credentials over a cleartext client connection.
             error_response(StatusCode::FORBIDDEN, "forbidden\n")
         } else {
+            if !request_headers_within_limits(request.headers()) {
+                return bodyless_for_head(
+                    &method,
+                    error_response(
+                        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                        "request headers too large\n",
+                    ),
+                );
+            }
+            if request_has_body(request.headers()) {
+                return bodyless_for_head(
+                    &method,
+                    error_response(StatusCode::BAD_REQUEST, "invalid request\n"),
+                );
+            }
             return next.run(request).await;
         };
         return bodyless_for_head(&method, response);
     }
+    if !request_headers_within_limits(request.headers()) {
+        return bodyless_for_head(
+            &method,
+            error_response(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "request headers too large\n",
+            ),
+        );
+    }
+    if request_has_body(request.headers()) {
+        return bodyless_for_head(
+            &method,
+            error_response(StatusCode::BAD_REQUEST, "invalid request\n"),
+        );
+    }
     next.run(request).await
+}
+
+fn request_headers_within_limits(headers: &HeaderMap) -> bool {
+    let mut field_count = 0_usize;
+    let mut byte_count = 0_usize;
+    for name in headers.keys() {
+        for value in headers.get_all(name).iter() {
+            field_count += 1;
+            byte_count = match byte_count
+                .checked_add(name.as_str().len())
+                .and_then(|count| count.checked_add(value.as_bytes().len()))
+            {
+                Some(count) => count,
+                None => return false,
+            };
+            if field_count > MAX_REQUEST_HEADER_FIELDS || byte_count > MAX_REQUEST_HEADER_BYTES {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn request_has_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return true;
+    }
+    headers.get_all(header::CONTENT_LENGTH).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|length| length.parse::<u64>().ok())
+            .is_none_or(|length| length > 0)
+    })
 }
 
 type PendingTlsHandshake = Pin<
@@ -711,6 +786,36 @@ mod tests {
             retry_after: None,
             challenge_relay_allowed: relay_allowed,
         })
+    }
+
+    #[test]
+    fn request_header_and_body_limits_fail_closed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert!(!request_has_body(&headers));
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert!(request_has_body(&headers));
+        headers.remove(header::CONTENT_LENGTH);
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        assert!(request_has_body(&headers));
+
+        let mut headers = HeaderMap::new();
+        for index in 0..=MAX_REQUEST_HEADER_FIELDS {
+            let name =
+                axum::http::HeaderName::from_bytes(format!("x-test-{index}").as_bytes()).unwrap();
+            headers.insert(name, HeaderValue::from_static("v"));
+        }
+        assert!(!request_headers_within_limits(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static("x-test"),
+            HeaderValue::from_bytes(&vec![b'a'; MAX_REQUEST_HEADER_BYTES]).unwrap(),
+        );
+        assert!(!request_headers_within_limits(&headers));
     }
 
     #[test]
