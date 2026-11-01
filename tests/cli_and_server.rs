@@ -127,8 +127,18 @@ fn help_exposes_stable_command_groups_and_crud_verbs() {
         .unwrap();
     assert!(serve_help.status.success());
     let serve_help = String::from_utf8(serve_help.stdout).unwrap();
-    assert!(serve_help.contains("--tls-cert"));
-    assert!(serve_help.contains("--tls-key"));
+    for option in [
+        "--tls-cert",
+        "--tls-key",
+        "--max-concurrent-requests",
+        "--request-timeout-seconds",
+        "--registry-request-timeout-seconds",
+        "--stream-idle-timeout-seconds",
+        "--max-autoindex-spool-bytes",
+        "--max-autoindex-spool-total-bytes",
+    ] {
+        assert!(serve_help.contains(option), "serve help omitted {option}");
+    }
 
     for (group, verbs) in [
         (
@@ -212,6 +222,37 @@ fn invalid_arguments_and_mount_usage_fail_actionably() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    let invalid_limit = Command::new(binary())
+        .args([
+            "serve",
+            "--config",
+            "config.example.toml",
+            "--max-concurrent-requests",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_limit.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&invalid_limit.stderr).contains("invalid value"));
+
+    let invalid_spool_budget = Command::new(binary())
+        .args([
+            "serve",
+            "--config",
+            "config.example.toml",
+            "--max-autoindex-spool-bytes",
+            "4096",
+            "--max-autoindex-spool-total-bytes",
+            "2048",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_spool_budget.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&invalid_spool_budget.stderr)
+            .contains("total-bytes must be at least")
+    );
 
     let create_help = Command::new(binary())
         .args(["artifact", "create", "--help"])

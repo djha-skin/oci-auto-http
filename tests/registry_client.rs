@@ -1846,6 +1846,151 @@ repository = "team/releases"
 }
 
 #[tokio::test]
+async fn serve_bounds_total_and_upstream_registry_request_timeouts() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("timeout.txt").unwrap(),
+        Bytes::from_static(b"timeout fixture"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+    let delayed_path = format!(
+        "/v2/{}/manifests/{}",
+        registry.mount.repository, registry.mount.root_tag
+    );
+    let proxy = FaultProxy::delaying_request(&registry, delayed_path, Duration::from_secs(2)).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("timeouts.toml");
+
+    for (request_timeout, registry_timeout) in [(1, 10), (10, 1)] {
+        fs::write(
+            &config_path,
+            format!(
+                "version = 1\n[server]\nrequest_timeout_seconds = {request_timeout}\nregistry_request_timeout_seconds = {registry_timeout}\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+                proxy.base_url
+            ),
+        )
+        .unwrap();
+        let address = unused_http_address();
+        let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+        wait_for_http_server(&mut server.child, address);
+
+        let response = tokio::task::spawn_blocking(move || {
+            http_request(address, "GET", "/files/timeout.txt", &[])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 504);
+        assert_eq!(response.body, b"gateway timeout\n");
+        assert!(
+            proxy.delay_fired(),
+            "timeout case request_timeout={request_timeout}, registry_timeout={registry_timeout} reached {} proxy requests without matching the delay path",
+            proxy.total_requests()
+        );
+        stop_http_server(&mut server);
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        proxy.state.delay_fired.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn serve_enforces_idle_timeout_after_stream_headers_are_sent() {
+    let registry = TestRegistry::new(false);
+    let file_bytes = Bytes::from_static(b"idle timeout fixture");
+    let expected_size = file_bytes.len();
+    let digest = Digest::from_bytes(&file_bytes);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("slow.bin").unwrap(),
+        file_bytes,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let proxy = FaultProxy::slowly_tracking_blob(&registry, &digest, Duration::from_secs(2)).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("idle-timeout.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[server]\nrequest_timeout_seconds = 10\nregistry_request_timeout_seconds = 10\nstream_idle_timeout_seconds = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let partial =
+        tokio::task::spawn_blocking(move || read_http_response_partial(address, "/files/slow.bin"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(partial.status, 200);
+    assert_eq!(
+        partial.headers.get("content-length").unwrap(),
+        &expected_size.to_string()
+    );
+    assert!(
+        partial.body.len() < expected_size,
+        "an idle timeout after headers must terminate the representation as incomplete"
+    );
+    assert!(proxy.tracked_blob_requests() >= 1);
+    let health = http_request(address, "GET", "/healthz", &[]).unwrap();
+    assert_eq!(health.status, 204);
+    stop_http_server(&mut server);
+}
+
+#[tokio::test]
+async fn serve_rejects_autoindexes_that_exceed_the_configured_spool_limit() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("long-entry-name.txt").unwrap(),
+        Bytes::from_static(b"listed"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("small-spool.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[server]\nmax_autoindex_spool_bytes = 128\nmax_autoindex_spool_total_bytes = 128\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            registry.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let response = http_request(address, "GET", "/files/", &[]).unwrap();
+    assert_eq!(response.status, 503);
+    assert_eq!(response.body, b"service unavailable\n");
+    assert_eq!(
+        response.headers.get("cache-control").unwrap(),
+        "private, no-store"
+    );
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains("registry.example"));
+}
+
+#[tokio::test]
 async fn serve_maps_a_late_autoindex_page_challenge_before_committing_success_headers() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -2074,6 +2219,110 @@ repository = "team/releases"
         "disconnect consumed too much of the upstream blob"
     );
     let stderr = stop_http_server(&mut proxied_server);
+    assert!(!stderr.contains("registry.example"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn serve_bounds_inflight_streams_and_releases_request_permits() {
+    let registry = TestRegistry::new(false);
+    let total_size = 32 * 1024 * 1024_u64;
+    let large_bytes = Bytes::from(vec![0x5a; total_size as usize]);
+    let digest = Digest::from_bytes(&large_bytes);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("large.bin").unwrap(),
+        large_bytes,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("small.txt").unwrap(),
+        Bytes::from_static(b"small complete response"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    drop(tree);
+
+    let proxy = FaultProxy::tracking_blob(&registry, &digest).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("concurrency.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[server]\nmax_concurrent_requests = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let (open_response, status, headers) =
+        tokio::task::spawn_blocking(move || open_http_response_head(address, "/files/large.bin"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-length").unwrap(),
+        &total_size.to_string()
+    );
+    wait_for_proxy_blob_bytes(&proxy, 256 * 1024).await;
+    assert!(proxy.tracked_blob_bytes() < total_size);
+
+    let proxy_requests_before_saturated = proxy.total_requests();
+    let saturated = http_request(address, "GET", "/files/large.bin", &[]).unwrap();
+    assert_eq!(saturated.status, 503);
+    assert_eq!(saturated.body, b"service unavailable\n");
+    assert_eq!(
+        proxy.total_requests(),
+        proxy_requests_before_saturated,
+        "a saturated request must be rejected before registry work"
+    );
+    drop(open_response);
+    let release_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health = http_request(address, "GET", "/healthz", &[]).unwrap();
+        if health.status == 204 {
+            break;
+        }
+        assert_eq!(
+            health.status, 503,
+            "unexpected response while awaiting disconnect cleanup"
+        );
+        assert!(
+            Instant::now() < release_deadline,
+            "request permit was not released after the client disconnected"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let completed = client
+        .get(format!("http://{address}/files/small.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        completed.bytes().await.unwrap().as_ref(),
+        b"small complete response"
+    );
+    let health = http_request(address, "GET", "/healthz", &[]).unwrap();
+    assert_eq!(
+        health.status, 204,
+        "the permit must be released after body EOF"
+    );
+    let stderr = stop_http_server(&mut server);
     assert!(!stderr.contains("registry.example"));
 }
 
@@ -2663,6 +2912,22 @@ fn stream_http_response(
 }
 
 #[cfg(target_os = "linux")]
+fn open_http_response_head(
+    address: SocketAddr,
+    target: &str,
+) -> io::Result<(BufReader<TcpStream>, u16, HashMap<String, String>)> {
+    let mut socket = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(
+        socket,
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut reader = BufReader::new(socket);
+    let (status, headers) = read_http_response_head(&mut reader)?;
+    Ok((reader, status, headers))
+}
+
+#[cfg(target_os = "linux")]
 fn disconnect_http_response(
     address: SocketAddr,
     target: &str,
@@ -3038,6 +3303,9 @@ struct FaultProxyOptions {
     rate_limit_after: Option<HeaderValue>,
     auth_challenge_path: Option<String>,
     auth_challenge_after: usize,
+    delayed_request_path: Option<String>,
+    delayed_request: Duration,
+    tracked_blob_delay: Duration,
 }
 
 impl Default for FaultProxyOptions {
@@ -3050,6 +3318,9 @@ impl Default for FaultProxyOptions {
             rate_limit_after: None,
             auth_challenge_path: None,
             auth_challenge_after: 0,
+            delayed_request_path: None,
+            delayed_request: Duration::ZERO,
+            tracked_blob_delay: Duration::from_millis(2),
         }
     }
 }
@@ -3074,6 +3345,10 @@ struct FaultState {
     auth_challenge_after: usize,
     auth_challenge_matches: AtomicUsize,
     auth_challenge_fired: AtomicBool,
+    delayed_request_path: Option<String>,
+    delayed_request: Duration,
+    delay_fired: AtomicBool,
+    tracked_blob_delay: Duration,
 }
 
 struct FaultProxy {
@@ -3152,6 +3427,35 @@ impl FaultProxy {
         .await
     }
 
+    async fn delaying_request(registry: &TestRegistry, path: String, delay: Duration) -> Self {
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                delayed_request_path: Some(path),
+                delayed_request: delay,
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn slowly_tracking_blob(
+        registry: &TestRegistry,
+        digest: &Digest,
+        delay: Duration,
+    ) -> Self {
+        let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                tracked_blob_path: Some(path),
+                tracked_blob_delay: delay,
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
+    }
+
     async fn new_with_tracked_blob(registry: &TestRegistry, options: FaultProxyOptions) -> Self {
         let FaultProxyOptions {
             mode,
@@ -3161,6 +3465,9 @@ impl FaultProxy {
             rate_limit_after,
             auth_challenge_path,
             auth_challenge_after,
+            delayed_request_path,
+            delayed_request,
+            tracked_blob_delay,
         } = options;
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
@@ -3232,6 +3539,10 @@ impl FaultProxy {
             auth_challenge_after,
             auth_challenge_matches: AtomicUsize::new(0),
             auth_challenge_fired: AtomicBool::new(false),
+            delayed_request_path,
+            delayed_request,
+            delay_fired: AtomicBool::new(false),
+            tracked_blob_delay,
         });
         let task = {
             let upstream = registry.base_url.clone();
@@ -3315,6 +3626,10 @@ impl FaultProxy {
         self.state.auth_challenge_fired.load(Ordering::SeqCst)
     }
 
+    fn delay_fired(&self) -> bool {
+        self.state.delay_fired.load(Ordering::SeqCst)
+    }
+
     fn registry_client(&self, registry: &TestRegistry) -> RegistryClient {
         let mut mount: Mount = registry.mount.clone();
         mount.registry = Url::parse(&self.base_url).unwrap();
@@ -3356,6 +3671,10 @@ async fn proxy_registry_request(
 
     let (parts, body) = request.into_parts();
     state.total_requests.fetch_add(1, Ordering::SeqCst);
+    if state.delayed_request_path.as_deref() == Some(parts.uri.path()) {
+        state.delay_fired.store(true, Ordering::SeqCst);
+        tokio::time::sleep(state.delayed_request).await;
+    }
     if parts.method == reqwest::Method::GET
         && state.auth_challenge_path.as_deref() == Some(parts.uri.path())
     {
@@ -3431,6 +3750,7 @@ async fn proxy_registry_request(
 
     let metrics = Arc::clone(&state);
     let corrupt_tracked_blob = tracked_blob && state.corrupt_tracked_blob;
+    let tracked_blob_delay = state.tracked_blob_delay;
     let response_body = response
         .bytes_stream()
         .map(move |result| match result {
@@ -3454,7 +3774,7 @@ async fn proxy_registry_request(
         })
         .then(move |chunk| async move {
             if tracked_blob && chunk.is_ok() {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                tokio::time::sleep(tracked_blob_delay).await;
             }
             chunk
         });

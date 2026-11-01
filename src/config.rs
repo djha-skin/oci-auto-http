@@ -1,4 +1,4 @@
-use std::{fs, net::SocketAddr, path::Path};
+use std::{fs, net::SocketAddr, path::Path, time::Duration};
 
 use serde::Deserialize;
 use url::Url;
@@ -11,11 +11,32 @@ use crate::{
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_ROOT_TAG: &str = "oci-auto-http-tree-v1";
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_REGISTRY_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_MAX_AUTOINDEX_SPOOL_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_MAX_AUTOINDEX_SPOOL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
+const MAX_TIMEOUT_SECONDS: u64 = 3600;
+const MAX_AUTOINDEX_SPOOL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_AUTOINDEX_SPOOL_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen: SocketAddr,
     pub mounts: Vec<Mount>,
+    pub server: ServerSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerSettings {
+    pub max_concurrent_requests: usize,
+    pub request_timeout: Duration,
+    pub registry_request_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+    pub max_autoindex_spool_bytes: u64,
+    pub max_autoindex_spool_total_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -74,15 +95,27 @@ struct RawConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct RawServer {
     listen: Option<String>,
+    max_concurrent_requests: Option<usize>,
+    request_timeout_seconds: Option<u64>,
+    registry_request_timeout_seconds: Option<u64>,
+    stream_idle_timeout_seconds: Option<u64>,
+    max_autoindex_spool_bytes: Option<u64>,
+    max_autoindex_spool_total_bytes: Option<u64>,
 }
 
 impl Default for RawServer {
     fn default() -> Self {
         Self {
             listen: Some(DEFAULT_LISTEN.to_owned()),
+            max_concurrent_requests: Some(DEFAULT_MAX_CONCURRENT_REQUESTS),
+            request_timeout_seconds: Some(DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            registry_request_timeout_seconds: Some(DEFAULT_REGISTRY_REQUEST_TIMEOUT_SECONDS),
+            stream_idle_timeout_seconds: Some(DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS),
+            max_autoindex_spool_bytes: Some(DEFAULT_MAX_AUTOINDEX_SPOOL_BYTES),
+            max_autoindex_spool_total_bytes: Some(DEFAULT_MAX_AUTOINDEX_SPOOL_TOTAL_BYTES),
         }
     }
 }
@@ -117,6 +150,7 @@ impl Config {
                 "unsupported configuration version; expected version 1",
             ));
         }
+        let server = validate_server_settings(path, &raw.server)?;
 
         let listen = raw
             .server
@@ -226,7 +260,11 @@ impl Config {
             });
         }
 
-        Ok(Self { listen, mounts })
+        Ok(Self {
+            listen,
+            mounts,
+            server,
+        })
     }
 
     /// Decode an escaped origin-form path once and select its configured mount.
@@ -301,6 +339,66 @@ fn decode_request_component(raw: &str) -> Result<String, TreeError> {
         }
     }
     String::from_utf8(decoded).map_err(|_| TreeError::InvalidPath)
+}
+
+fn validate_server_settings(path: &Path, raw: &RawServer) -> Result<ServerSettings, AppError> {
+    let max_concurrent_requests = raw
+        .max_concurrent_requests
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
+    if !(1..=MAX_CONCURRENT_REQUESTS).contains(&max_concurrent_requests) {
+        return Err(invalid_config(
+            path,
+            "server.max_concurrent_requests must be between 1 and 1024",
+        ));
+    }
+
+    let request_timeout_seconds = raw
+        .request_timeout_seconds
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS);
+    let registry_request_timeout_seconds = raw
+        .registry_request_timeout_seconds
+        .unwrap_or(DEFAULT_REGISTRY_REQUEST_TIMEOUT_SECONDS);
+    let stream_idle_timeout_seconds = raw
+        .stream_idle_timeout_seconds
+        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS);
+    if [
+        request_timeout_seconds,
+        registry_request_timeout_seconds,
+        stream_idle_timeout_seconds,
+    ]
+    .iter()
+    .any(|seconds| !(1..=MAX_TIMEOUT_SECONDS).contains(seconds))
+    {
+        return Err(invalid_config(
+            path,
+            "server request and stream timeouts must be between 1 and 3600 seconds",
+        ));
+    }
+
+    let max_autoindex_spool_bytes = raw
+        .max_autoindex_spool_bytes
+        .unwrap_or(DEFAULT_MAX_AUTOINDEX_SPOOL_BYTES);
+    let max_autoindex_spool_total_bytes = raw
+        .max_autoindex_spool_total_bytes
+        .unwrap_or(DEFAULT_MAX_AUTOINDEX_SPOOL_TOTAL_BYTES);
+    if !(1..=MAX_AUTOINDEX_SPOOL_BYTES).contains(&max_autoindex_spool_bytes)
+        || !(1..=MAX_AUTOINDEX_SPOOL_TOTAL_BYTES).contains(&max_autoindex_spool_total_bytes)
+        || max_autoindex_spool_total_bytes < max_autoindex_spool_bytes
+    {
+        return Err(invalid_config(
+            path,
+            "server autoindex spool limits must be positive, bounded, and total bytes must be at least per-listing bytes",
+        ));
+    }
+
+    Ok(ServerSettings {
+        max_concurrent_requests,
+        request_timeout: Duration::from_secs(request_timeout_seconds),
+        registry_request_timeout: Duration::from_secs(registry_request_timeout_seconds),
+        stream_idle_timeout: Duration::from_secs(stream_idle_timeout_seconds),
+        max_autoindex_spool_bytes,
+        max_autoindex_spool_total_bytes,
+    })
 }
 
 fn invalid_config(path: &Path, reason: &str) -> AppError {
@@ -550,4 +648,67 @@ fn hex_digit(value: u8) -> u8 {
 
 fn is_control(character: char) -> bool {
     matches!(character as u32, 0x00..=0x1f | 0x7f..=0x9f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(server: &str) -> String {
+        format!(
+            "version = 1\n\n[server]\n{server}\n[[mounts]]\nname = \"demo\"\nprefix = \"/demo\"\nregistry = \"https://registry.example\"\nrepository = \"team/demo\"\n"
+        )
+    }
+
+    #[test]
+    fn server_resource_settings_have_safe_defaults_and_parse_overrides() {
+        let default = Config::parse(Path::new("settings.toml"), &config("")).unwrap();
+        assert_eq!(default.server.max_concurrent_requests, 64);
+        assert_eq!(default.server.request_timeout, Duration::from_secs(300));
+        assert_eq!(
+            default.server.registry_request_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(default.server.stream_idle_timeout, Duration::from_secs(30));
+        assert_eq!(default.server.max_autoindex_spool_bytes, 16 * 1024 * 1024);
+        assert_eq!(
+            default.server.max_autoindex_spool_total_bytes,
+            256 * 1024 * 1024
+        );
+
+        let custom = Config::parse(
+            Path::new("settings.toml"),
+            &config(
+                "max_concurrent_requests = 2\nrequest_timeout_seconds = 11\nregistry_request_timeout_seconds = 7\nstream_idle_timeout_seconds = 5\nmax_autoindex_spool_bytes = 4096\nmax_autoindex_spool_total_bytes = 8192",
+            ),
+        )
+        .unwrap();
+        assert_eq!(custom.server.max_concurrent_requests, 2);
+        assert_eq!(custom.server.request_timeout, Duration::from_secs(11));
+        assert_eq!(
+            custom.server.registry_request_timeout,
+            Duration::from_secs(7)
+        );
+        assert_eq!(custom.server.stream_idle_timeout, Duration::from_secs(5));
+        assert_eq!(custom.server.max_autoindex_spool_bytes, 4096);
+        assert_eq!(custom.server.max_autoindex_spool_total_bytes, 8192);
+    }
+
+    #[test]
+    fn server_resource_settings_reject_invalid_limits() {
+        for settings in [
+            "max_concurrent_requests = 0",
+            "max_concurrent_requests = 1025",
+            "request_timeout_seconds = 0",
+            "registry_request_timeout_seconds = 3601",
+            "stream_idle_timeout_seconds = 0",
+            "max_autoindex_spool_bytes = 0",
+            "max_autoindex_spool_total_bytes = 4096\nmax_autoindex_spool_bytes = 8192",
+        ] {
+            assert!(
+                Config::parse(Path::new("settings.toml"), &config(settings)).is_err(),
+                "invalid server settings were accepted: {settings}"
+            );
+        }
+    }
 }

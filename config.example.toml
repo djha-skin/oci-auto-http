@@ -2,6 +2,12 @@ version = 1
 
 [server]
 listen = "127.0.0.1:8080"
+max_concurrent_requests = 64
+request_timeout_seconds = 300
+registry_request_timeout_seconds = 30
+stream_idle_timeout_seconds = 30
+max_autoindex_spool_bytes = 16777216
+max_autoindex_spool_total_bytes = 268435456
 
 [[mounts]]
 name = "packages"

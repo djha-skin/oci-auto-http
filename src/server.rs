@@ -21,14 +21,17 @@ use axum::{
     routing::get,
     serve::Listener,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{StreamExt, stream, stream::FuturesUnordered};
 use oci_auto_http::{
     config::{Config, ResolvedPath},
     error::AppError,
     registry::{ClientPolicy, ErrorKind, RegistryClient},
     tree::{TreeError, TreeStore},
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 use tokio_rustls::rustls::{
     ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
@@ -49,6 +52,8 @@ struct ServeState {
     config: Config,
     stores: Vec<TreeStore>,
     secure_listener: bool,
+    request_slots: Arc<Semaphore>,
+    autoindex_spool_budget: file::AutoIndexSpoolBudget,
 }
 
 pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
@@ -56,6 +61,7 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     if let Some(listen) = args.listen {
         config.listen = listen;
     }
+    apply_server_overrides(&mut config, &args)?;
     let tls_acceptor = match (args.tls_cert.as_deref(), args.tls_key.as_deref()) {
         (Some(certificate), Some(key)) => Some(load_tls_acceptor(certificate, key)?),
         (None, None) => None,
@@ -63,7 +69,10 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     };
     let secure_listener = tls_acceptor.is_some();
 
-    let mut policy = ClientPolicy::default();
+    let mut policy = ClientPolicy {
+        request_timeout: config.server.registry_request_timeout,
+        ..ClientPolicy::default()
+    };
     if let Some(certificate_path) = args.ca_cert {
         let certificate = read_ca_certificate(&certificate_path)?;
         policy = policy.with_root_certificate_pem(&certificate);
@@ -76,10 +85,17 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
             Ok(TreeStore::new(registry)?)
         })
         .collect::<Result<Vec<_>, AppError>>()?;
+    let request_slots = Arc::new(Semaphore::new(config.server.max_concurrent_requests));
+    let autoindex_spool_budget = file::AutoIndexSpoolBudget::new(
+        config.server.max_autoindex_spool_bytes,
+        config.server.max_autoindex_spool_total_bytes,
+    );
     let state = Arc::new(ServeState {
         config,
         stores,
         secure_listener,
+        request_slots,
+        autoindex_spool_budget,
     });
 
     let listener = TcpListener::bind(state.config.listen)
@@ -96,6 +112,10 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
         .layer(middleware::from_fn_with_state(
             secure_listener,
             enforce_authorization_transport,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_request_limits,
         ))
         .with_state(state.clone());
 
@@ -114,6 +134,109 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     }
     info!(%address, "HTTP listener stopped");
     Ok(())
+}
+
+fn apply_server_overrides(config: &mut Config, args: &ServeArgs) -> Result<(), AppError> {
+    if let Some(value) = args.max_concurrent_requests {
+        config.server.max_concurrent_requests =
+            usize::try_from(value).map_err(|_| AppError::InvalidConfig {
+                path: args.config.clone(),
+                reason: "server max-concurrent-requests is out of range".to_owned(),
+            })?;
+    }
+    if let Some(value) = args.request_timeout_seconds {
+        config.server.request_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = args.registry_request_timeout_seconds {
+        config.server.registry_request_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = args.stream_idle_timeout_seconds {
+        config.server.stream_idle_timeout = Duration::from_secs(value);
+    }
+    if let Some(value) = args.max_autoindex_spool_bytes {
+        config.server.max_autoindex_spool_bytes = value;
+    }
+    if let Some(value) = args.max_autoindex_spool_total_bytes {
+        config.server.max_autoindex_spool_total_bytes = value;
+    }
+    if config.server.max_autoindex_spool_total_bytes < config.server.max_autoindex_spool_bytes {
+        return Err(AppError::InvalidConfig {
+            path: args.config.clone(),
+            reason:
+                "server max-autoindex-spool-total-bytes must be at least max-autoindex-spool-bytes"
+                    .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+async fn enforce_request_limits(
+    State(state): State<Arc<ServeState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let permit = match Arc::clone(&state.request_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return bodyless_for_head(
+                &method,
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n"),
+            );
+        }
+    };
+    let deadline = tokio::time::Instant::now() + state.config.server.request_timeout;
+    let (response, body_deadline) = match tokio::time::timeout_at(deadline, next.run(request)).await
+    {
+        Ok(response) => (response, deadline),
+        Err(_) => {
+            warn!("HTTP request exceeded configured total timeout");
+            let response = bodyless_for_head(
+                &method,
+                error_response(StatusCode::GATEWAY_TIMEOUT, "gateway timeout\n"),
+            );
+            let error_body_deadline =
+                tokio::time::Instant::now() + state.config.server.stream_idle_timeout;
+            (response, error_body_deadline)
+        }
+    };
+    let (parts, body) = response.into_parts();
+    let body_stream = body.into_data_stream();
+    let idle_timeout = state.config.server.stream_idle_timeout;
+    let guarded_body = stream::unfold(Some((body_stream, permit)), move |state| async move {
+        let (mut body_stream, permit) = state?;
+        let remaining = body_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let timeout = remaining.min(idle_timeout);
+        if timeout.is_zero() {
+            warn!("HTTP response stream exceeded configured timeout");
+            return Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HTTP response stream timed out",
+                )),
+                None,
+            ));
+        }
+        match tokio::time::timeout(timeout, body_stream.next()).await {
+            Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some((body_stream, permit)))),
+            Ok(Some(Err(_))) => {
+                warn!("HTTP response stream failed");
+                Some((Err(io::Error::other("HTTP response stream failed")), None))
+            }
+            Ok(None) => None,
+            Err(_) => {
+                warn!("HTTP response stream exceeded configured timeout");
+                Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP response stream timed out",
+                    )),
+                    None,
+                ))
+            }
+        }
+    });
+    Response::from_parts(parts, Body::from_stream(guarded_body))
 }
 
 async fn enforce_authorization_transport(
@@ -329,6 +452,7 @@ async fn route_request_inner(
                 page,
                 method,
                 authorization,
+                state.autoindex_spool_budget.clone(),
             )
             .await
             {

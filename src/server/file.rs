@@ -1,6 +1,10 @@
 use std::{
     collections::VecDeque,
     io::{self, SeekFrom},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use axum::{
@@ -154,6 +158,77 @@ pub(super) fn accepts_html(headers: &HeaderMap) -> bool {
     exact_html.or(text_wildcard).or(any_wildcard).unwrap_or(0.0) > 0.0
 }
 
+#[derive(Clone)]
+pub(super) struct AutoIndexSpoolBudget {
+    max_listing_bytes: u64,
+    max_total_bytes: u64,
+    reserved_bytes: Arc<AtomicU64>,
+}
+
+impl AutoIndexSpoolBudget {
+    pub(super) fn new(max_listing_bytes: u64, max_total_bytes: u64) -> Self {
+        Self {
+            max_listing_bytes,
+            max_total_bytes,
+            reserved_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn lease(&self) -> AutoIndexSpoolLease {
+        AutoIndexSpoolLease {
+            budget: Arc::clone(&self.reserved_bytes),
+            max_listing_bytes: self.max_listing_bytes,
+            max_total_bytes: self.max_total_bytes,
+            reserved_bytes: 0,
+        }
+    }
+}
+
+struct AutoIndexSpoolLease {
+    budget: Arc<AtomicU64>,
+    max_listing_bytes: u64,
+    max_total_bytes: u64,
+    reserved_bytes: u64,
+}
+
+impl AutoIndexSpoolLease {
+    fn reserve(&mut self, bytes: u64) -> bool {
+        let Some(listing_total) = self.reserved_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if listing_total > self.max_listing_bytes {
+            return false;
+        }
+        let mut total = self.budget.load(Ordering::Acquire);
+        loop {
+            let Some(total_with_reservation) = total.checked_add(bytes) else {
+                return false;
+            };
+            if total_with_reservation > self.max_total_bytes {
+                return false;
+            }
+            match self.budget.compare_exchange_weak(
+                total,
+                total_with_reservation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.reserved_bytes = listing_total;
+                    return true;
+                }
+                Err(actual) => total = actual,
+            }
+        }
+    }
+}
+
+impl Drop for AutoIndexSpoolLease {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+    }
+}
+
 pub(super) enum DirectoryResponseError {
     Tree(TreeError),
     TemporaryStorage,
@@ -171,6 +246,7 @@ pub(super) async fn directory_response(
     first_page: DirectoryPage,
     method: Method,
     authorization: Option<HeaderValue>,
+    spool_budget: AutoIndexSpoolBudget,
 ) -> Result<Response, DirectoryResponseError> {
     let body = if method == Method::HEAD {
         Body::from_stream(stream::empty::<Result<Bytes, io::Error>>())
@@ -196,7 +272,7 @@ pub(super) async fn directory_response(
             footer_pending: true,
             authorization,
         };
-        Body::from_stream(spool_autoindex(state).await?)
+        Body::from_stream(spool_autoindex(state, spool_budget).await?)
     };
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -215,13 +291,18 @@ pub(super) async fn directory_response(
 
 async fn spool_autoindex(
     state: AutoIndexStreamState,
+    budget: AutoIndexSpoolBudget,
 ) -> Result<impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static, DirectoryResponseError> {
     let file = tempfile::tempfile().map_err(|_| DirectoryResponseError::TemporaryStorage)?;
     let mut file = tokio::fs::File::from_std(file);
+    let mut lease = budget.lease();
     let chunks = autoindex_stream(state);
     futures_util::pin_mut!(chunks);
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk?;
+        if !lease.reserve(chunk.len() as u64) {
+            return Err(DirectoryResponseError::TemporaryStorage);
+        }
         file.write_all(&chunk)
             .await
             .map_err(|_| DirectoryResponseError::TemporaryStorage)?;
@@ -233,16 +314,19 @@ async fn spool_autoindex(
         .await
         .map_err(|_| DirectoryResponseError::TemporaryStorage)?;
 
-    Ok(stream::try_unfold(file, |mut file| async move {
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let count = file.read(&mut buffer).await?;
-        if count == 0 {
-            Ok(None)
-        } else {
-            buffer.truncate(count);
-            Ok(Some((Bytes::from(buffer), file)))
-        }
-    }))
+    Ok(stream::try_unfold(
+        (file, lease),
+        |(mut file, lease)| async move {
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let count = file.read(&mut buffer).await?;
+            if count == 0 {
+                Ok(None)
+            } else {
+                buffer.truncate(count);
+                Ok(Some((Bytes::from(buffer), (file, lease))))
+            }
+        },
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -931,6 +1015,29 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn autoindex_spool_budget_bounds_each_listing_and_aggregate_storage() {
+        let budget = AutoIndexSpoolBudget::new(10, 12);
+        let mut first = budget.lease();
+        assert!(first.reserve(7));
+        assert!(!first.reserve(4), "per-listing limit was not enforced");
+
+        let mut second = budget.lease();
+        assert!(second.reserve(5));
+        assert!(!second.reserve(1), "aggregate limit was not enforced");
+
+        drop(first);
+        assert!(
+            second.reserve(1),
+            "dropping a spool must release its budget"
+        );
+        drop(second);
+
+        let mut recovered = budget.lease();
+        assert!(recovered.reserve(10));
+        assert!(!recovered.reserve(1));
     }
 
     #[test]

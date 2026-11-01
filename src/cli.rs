@@ -52,6 +52,24 @@ pub struct ServeArgs {
     /// Override the listen address configured in the file.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
+    /// Maximum in-flight HTTP requests (1-1024).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub max_concurrent_requests: Option<u64>,
+    /// Maximum total time for one HTTP request, in seconds (1-3600).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub request_timeout_seconds: Option<u64>,
+    /// Maximum duration of one upstream registry HTTP operation, in seconds (1-3600).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub registry_request_timeout_seconds: Option<u64>,
+    /// Maximum idle time between HTTP response chunks, in seconds (1-3600).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub stream_idle_timeout_seconds: Option<u64>,
+    /// Maximum rendered byte size of one directory autoindex spool.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+    pub max_autoindex_spool_bytes: Option<u64>,
+    /// Maximum aggregate autoindex spool storage across in-flight requests.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=8_589_934_592))]
+    pub max_autoindex_spool_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
