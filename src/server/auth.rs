@@ -6,7 +6,7 @@ const MAX_CHALLENGE_BYTES: usize = 64 * 1024;
 /// Validate upstream WWW-Authenticate fields without rewriting them.
 ///
 /// Header values are relayed byte-for-byte only after the complete RFC 9110
-/// challenge grammar has been consumed and any Bearer realm is confirmed HTTPS.
+/// challenge grammar has been consumed and any URL-valued Bearer realm is HTTPS.
 pub(super) fn valid_challenges(challenges: &[HeaderValue]) -> bool {
     if challenges.is_empty() {
         return false;
@@ -83,7 +83,7 @@ impl<'a> ChallengeParser<'a> {
                 return false;
             };
             if bearer && name.eq_ignore_ascii_case(b"realm") {
-                if realm_seen || !valid_https_realm(&value) {
+                if realm_seen || !valid_bearer_realm(&value) {
                     return false;
                 }
                 realm_seen = true;
@@ -209,17 +209,27 @@ impl<'a> ChallengeParser<'a> {
     }
 }
 
-fn valid_https_realm(realm: &[u8]) -> bool {
+fn valid_bearer_realm(realm: &[u8]) -> bool {
     let Ok(realm) = std::str::from_utf8(realm) else {
         return false;
     };
-    let Ok(url) = Url::parse(realm) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none()
+    match Url::parse(realm) {
+        Ok(url) if url.cannot_be_a_base() => true,
+        Ok(url) if url.scheme() == "https" => {
+            url.host_str().is_some() && url.username().is_empty() && url.password().is_none()
+        }
+        Ok(_) => false,
+        Err(_) => {
+            !realm.starts_with("//")
+                && !realm
+                    .get(..5)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http:"))
+                && !realm
+                    .get(..6)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https:"))
+                && !realm.contains("://")
+        }
+    }
 }
 
 fn is_ows(byte: u8) -> bool {
@@ -270,6 +280,8 @@ mod tests {
         for challenge in [
             r#"Basic realm="registry""#,
             "Bearer",
+            r#"Bearer realm="example""#,
+            r#"Bearer realm="urn:example:registry""#,
             r#"Bearer realm="https://auth.example/token?a=one,two",service="registry",scope="repository:team/file:pull""#,
             "Negotiate YIIFhgYGKwYBBQUCoIIFdzCCBXOg",
             r#"Bearer realm = "https://auth.example/token",service = "registry""#,
@@ -293,6 +305,9 @@ mod tests {
             "",
             "Bearer realm=\"http://auth.example/token\"",
             "Bearer realm=\"https://user:secret@auth.example/token\"",
+            "Bearer realm=\"ftp://auth.example/token\"",
+            "Bearer realm=\"file:///etc/passwd\"",
+            "Bearer realm=\"//auth.example/token\"",
             "Bearer realm=\"https://auth.example/token\",broken=\"unterminated",
             "Bearer realm=\"https://auth.example/token\",",
             "B@sic token",

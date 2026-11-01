@@ -613,6 +613,7 @@ mod tests {
         let challenges = [
             r#"Basic realm="registry""#,
             r#"Bearer realm="https://auth.example/token",service="registry""#,
+            r#"Bearer realm="example""#,
         ];
         let response = tree_error_response(unauthorized_error(&challenges, true), true);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
