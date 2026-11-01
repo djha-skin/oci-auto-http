@@ -2056,6 +2056,76 @@ async fn serve_enforces_idle_timeout_after_stream_headers_are_sent() {
 }
 
 #[tokio::test]
+async fn serve_rejects_empty_userinfo_blob_redirects_before_contacting_the_allowlist() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("redirect.bin").unwrap(),
+        Bytes::from_static(b"redirect target guard"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let descriptor = tree
+        .stat_file(&StoragePath::parse_relative("redirect.bin").unwrap(), None)
+        .await
+        .unwrap();
+    drop(tree);
+
+    let trap = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let trap_address = trap.local_addr().unwrap();
+    let proxy = FaultProxy::redirecting_blob(
+        &registry,
+        &descriptor.digest,
+        format!("https://@{trap_address}/redirected"),
+    )
+    .await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("userinfo-redirect.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\nredirect_allowlist = [\"{}\"]\n",
+            proxy.base_url, trap_address
+        ),
+    )
+    .unwrap();
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let response = tokio::task::spawn_blocking(move || {
+        http_request(address, "GET", "/files/redirect.bin", &[])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status, 502);
+    assert_eq!(response.body, b"bad gateway\n");
+    assert!(!response.headers.contains_key("location"));
+    assert!(!response.headers.contains_key("www-authenticate"));
+    assert!(proxy.blob_redirect_fired());
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match trap.accept() {
+            Ok((_, peer)) => panic!("untrusted redirect target was contacted: {peer}"),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not inspect redirect trap listener: {error}"),
+        }
+    }
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains(&trap_address.to_string()));
+}
+
+#[tokio::test]
 async fn serve_rejects_autoindexes_that_exceed_the_configured_spool_limit() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -3778,6 +3848,8 @@ struct FaultProxyOptions {
     delayed_request_path: Option<String>,
     delayed_request: Duration,
     tracked_blob_delay: Duration,
+    blob_redirect_path: Option<String>,
+    blob_redirect_location: Option<String>,
 }
 
 impl Default for FaultProxyOptions {
@@ -3793,6 +3865,8 @@ impl Default for FaultProxyOptions {
             delayed_request_path: None,
             delayed_request: Duration::ZERO,
             tracked_blob_delay: Duration::from_millis(2),
+            blob_redirect_path: None,
+            blob_redirect_location: None,
         }
     }
 }
@@ -3821,6 +3895,9 @@ struct FaultState {
     delayed_request: Duration,
     delay_fired: AtomicBool,
     tracked_blob_delay: Duration,
+    blob_redirect_path: Option<String>,
+    blob_redirect_location: Option<String>,
+    blob_redirect_fired: AtomicBool,
 }
 
 struct FaultProxy {
@@ -3928,6 +4005,19 @@ impl FaultProxy {
         .await
     }
 
+    async fn redirecting_blob(registry: &TestRegistry, digest: &Digest, location: String) -> Self {
+        let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                blob_redirect_path: Some(path),
+                blob_redirect_location: Some(location),
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
+    }
+
     async fn new_with_tracked_blob(registry: &TestRegistry, options: FaultProxyOptions) -> Self {
         let FaultProxyOptions {
             mode,
@@ -3940,6 +4030,8 @@ impl FaultProxy {
             delayed_request_path,
             delayed_request,
             tracked_blob_delay,
+            blob_redirect_path,
+            blob_redirect_location,
         } = options;
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
@@ -4015,6 +4107,9 @@ impl FaultProxy {
             delayed_request,
             delay_fired: AtomicBool::new(false),
             tracked_blob_delay,
+            blob_redirect_path,
+            blob_redirect_location,
+            blob_redirect_fired: AtomicBool::new(false),
         });
         let task = {
             let upstream = registry.base_url.clone();
@@ -4102,6 +4197,10 @@ impl FaultProxy {
         self.state.delay_fired.load(Ordering::SeqCst)
     }
 
+    fn blob_redirect_fired(&self) -> bool {
+        self.state.blob_redirect_fired.load(Ordering::SeqCst)
+    }
+
     fn registry_client(&self, registry: &TestRegistry) -> RegistryClient {
         let mut mount: Mount = registry.mount.clone();
         mount.registry = Url::parse(&self.base_url).unwrap();
@@ -4146,6 +4245,19 @@ async fn proxy_registry_request(
     if state.delayed_request_path.as_deref() == Some(parts.uri.path()) {
         state.delay_fired.store(true, Ordering::SeqCst);
         tokio::time::sleep(state.delayed_request).await;
+    }
+    if parts.method == reqwest::Method::GET
+        && state.blob_redirect_path.as_deref() == Some(parts.uri.path())
+    {
+        state.blob_redirect_fired.store(true, Ordering::SeqCst);
+        return Response::builder()
+            .status(reqwest::StatusCode::FOUND)
+            .header(
+                reqwest::header::LOCATION,
+                state.blob_redirect_location.as_deref().unwrap(),
+            )
+            .body(AxumBody::empty())
+            .map_err(|error| io::Error::other(error.to_string()));
     }
     if parts.method == reqwest::Method::GET
         && state.auth_challenge_path.as_deref() == Some(parts.uri.path())
