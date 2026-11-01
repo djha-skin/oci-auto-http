@@ -1,8 +1,10 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
+
+use fs2::FileExt;
 
 use oci_auto_http::{
     config::{Config, Mount},
@@ -91,6 +93,7 @@ fn create(
     root_tag: Option<&str>,
     redirect_allowlist: &[String],
 ) -> Result<MountOutput, AppError> {
+    let _lock = MountConfigLock::acquire(path, true)?;
     let (mut document, original) = read_document(path, true)?;
     let mounts = mounts_mut(path, &mut document, true)?;
     if mounts
@@ -131,6 +134,7 @@ struct MountUpdate<'a> {
 }
 
 fn update(path: &Path, update: MountUpdate<'_>) -> Result<MountOutput, AppError> {
+    let _lock = MountConfigLock::acquire(path, false)?;
     let MountUpdate {
         name,
         prefix,
@@ -195,6 +199,7 @@ fn update(path: &Path, update: MountUpdate<'_>) -> Result<MountOutput, AppError>
 }
 
 fn delete(path: &Path, name: &str) -> Result<DeleteOutput, AppError> {
+    let _lock = MountConfigLock::acquire(path, false)?;
     let (mut document, original) = read_document(path, false)?;
     let config = Config::parse(path, original.as_deref().expect("existing config was read"))?;
     let mount_index = config
@@ -223,6 +228,86 @@ fn find_mount<'a>(config: &'a Config, name: &str) -> Result<&'a Mount, AppError>
         .ok_or_else(|| AppError::MountNotFound {
             name: name.to_owned(),
         })
+}
+
+struct MountConfigLock {
+    _file: File,
+}
+
+impl MountConfigLock {
+    fn acquire(config_path: &Path, allow_missing: bool) -> Result<Self, AppError> {
+        match fs::symlink_metadata(config_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(mount_io_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount configuration must not be a symlink",
+                )));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(mount_io_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount configuration must be a regular file",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(mount_io_error(error)),
+        }
+
+        let lock_path = lock_path(config_path)?;
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(mount_io_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount configuration lock must not be a symlink",
+                )));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(mount_io_error(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount configuration lock must be a regular file",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(mount_io_error(error)),
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path).map_err(mount_io_error)?;
+        if !file.metadata().map_err(mount_io_error)?.is_file() {
+            return Err(mount_io_error(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mount configuration lock must be a regular file",
+            )));
+        }
+        file.lock_exclusive().map_err(mount_io_error)?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn lock_path(config_path: &Path) -> Result<PathBuf, AppError> {
+    let file_name = config_path.file_name().ok_or_else(|| {
+        mount_io_error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mount configuration path must name a file",
+        ))
+    })?;
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent).map_err(mount_io_error)?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".oci-auto-http.lock");
+    Ok(parent.join(lock_name))
 }
 
 fn read_document(
@@ -546,6 +631,80 @@ repository = "team/mirror"
             Err(AppError::CannotDeleteLastMount)
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), remaining);
+    }
+
+    #[test]
+    fn concurrent_mount_updates_are_serialized_and_both_changes_survive() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, MOUNT_CONFIG).unwrap();
+
+        let first_lock = MountConfigLock::acquire(&path, false).unwrap();
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path(&path).unwrap())
+            .unwrap();
+        assert_eq!(
+            lock_file.try_lock_exclusive().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(lock_file);
+        drop(first_lock);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let package_path = path.clone();
+        let package_barrier = Arc::clone(&barrier);
+        let package_update = thread::spawn(move || {
+            package_barrier.wait();
+            update(
+                &package_path,
+                MountUpdate {
+                    name: "packages",
+                    prefix: Some("/packages-v2"),
+                    registry: None,
+                    repository: None,
+                    root_tag: None,
+                    reset_root_tag: false,
+                    redirect_allowlist: None,
+                    clear_redirect_allowlist: false,
+                },
+            )
+        });
+        let mirror_path = path.clone();
+        let mirror_barrier = Arc::clone(&barrier);
+        let mirror_update = thread::spawn(move || {
+            mirror_barrier.wait();
+            update(
+                &mirror_path,
+                MountUpdate {
+                    name: "mirror",
+                    prefix: None,
+                    registry: None,
+                    repository: Some("team/mirror-v2"),
+                    root_tag: None,
+                    reset_root_tag: false,
+                    redirect_allowlist: None,
+                    clear_redirect_allowlist: false,
+                },
+            )
+        });
+        barrier.wait();
+        package_update.join().unwrap().unwrap();
+        mirror_update.join().unwrap().unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            find_mount(&config, "packages").unwrap().prefix,
+            "/packages-v2"
+        );
+        assert_eq!(
+            find_mount(&config, "mirror").unwrap().repository,
+            "team/mirror-v2"
+        );
     }
 
     #[test]

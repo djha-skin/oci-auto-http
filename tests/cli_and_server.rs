@@ -78,13 +78,19 @@ redirect_allowlist = ["cdn.example:443"]
     .to_owned()
 }
 
-fn run_mount(config: &Path, args: &[&str]) -> std::process::Output {
+fn spawn_mount(config: &Path, args: &[&str]) -> std::process::Child {
     Command::new(binary())
         .args(["mount", "--config"])
         .arg(config)
         .args(args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap()
+}
+
+fn run_mount(config: &Path, args: &[&str]) -> std::process::Output {
+    spawn_mount(config, args).wait_with_output().unwrap()
 }
 
 fn binary() -> PathBuf {
@@ -205,6 +211,7 @@ fn mount_create_cli_initializes_a_missing_config_without_registry_access() {
     );
     let output: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
     assert_eq!(output["name"], "packages");
+    assert_eq!(output["registry"], "https://registry.example");
     assert_eq!(output["prefix"], "/packages");
     assert_eq!(output["root_tag"], "oci-auto-http-tree-v1");
     assert_eq!(output["redirect_allowlist"], serde_json::json!([]));
@@ -213,6 +220,40 @@ fn mount_create_cli_initializes_a_missing_config_without_registry_access() {
     let config = oci_auto_http::config::Config::load(&config_path).unwrap();
     assert_eq!(config.mounts.len(), 1);
     assert_eq!(config.mounts[0].repository, "team/packages");
+
+    let version_only_path = temp.path.join("version-only.toml");
+    fs::write(&version_only_path, "version = 1\n").unwrap();
+    let version_only = run_mount(
+        &version_only_path,
+        &[
+            "create",
+            "seed",
+            "--prefix",
+            "/seed",
+            "--registry",
+            "https://version-only.example",
+            "--repository",
+            "team/seed",
+        ],
+    );
+    assert!(
+        version_only.status.success(),
+        "version-only initialization failed: {}",
+        String::from_utf8_lossy(&version_only.stderr)
+    );
+    let version_only_json: serde_json::Value =
+        serde_json::from_slice(&version_only.stdout).unwrap();
+    assert_eq!(
+        version_only_json["registry"],
+        "https://version-only.example"
+    );
+    assert_eq!(
+        oci_auto_http::config::Config::load(&version_only_path)
+            .unwrap()
+            .mounts
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -318,6 +359,7 @@ redirect_allowlist = ["cdn-a.example:443"]
     );
     let updated: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
     assert_eq!(updated["prefix"], "/mirror-v2");
+    assert_eq!(updated["registry"], "https://reg-c.example:5443");
     assert_eq!(updated["repository"], "team/new-mirror");
     assert_eq!(updated["root_tag"], "mirror-v2");
     assert_eq!(updated["redirect_allowlist"].as_array().unwrap().len(), 2);
@@ -402,6 +444,110 @@ redirect_allowlist = ["cdn-a.example:443"]
         &["update", "missing", "--repository", "team/missing"],
     );
     assert_eq!(missing_update.status.code(), Some(66));
+}
+
+#[test]
+fn concurrent_mount_process_updates_preserve_both_changes() {
+    let temp = TempDir::new();
+    let config_path = temp.write_config(&valid_two_mount_config());
+    let lock_path = temp.path.join(".config.toml.oci-auto-http.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock_file).unwrap();
+
+    let mut packages = spawn_mount(
+        &config_path,
+        &["update", "packages", "--prefix", "/packages-v2"],
+    );
+    let mut mirror = spawn_mount(
+        &config_path,
+        &["update", "mirror", "--repository", "team/mirror-v2"],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(packages.try_wait().unwrap().is_none());
+    assert!(mirror.try_wait().unwrap().is_none());
+    drop(lock_file);
+
+    let packages = packages.wait_with_output().unwrap();
+    let mirror = mirror.wait_with_output().unwrap();
+    assert!(
+        packages.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packages.stderr)
+    );
+    assert!(
+        mirror.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mirror.stderr)
+    );
+    let config = oci_auto_http::config::Config::load(&config_path).unwrap();
+    assert_eq!(
+        config
+            .mounts
+            .iter()
+            .find(|mount| mount.name == "packages")
+            .unwrap()
+            .prefix,
+        "/packages-v2"
+    );
+    assert_eq!(
+        config
+            .mounts
+            .iter()
+            .find(|mount| mount.name == "mirror")
+            .unwrap()
+            .repository,
+        "team/mirror-v2"
+    );
+}
+
+#[test]
+fn mount_cli_refuses_non_regular_and_symlink_config_targets() {
+    let temp = TempDir::new();
+    let directory_path = temp.path.join("config-directory");
+    fs::create_dir(&directory_path).unwrap();
+    let directory = run_mount(
+        &directory_path,
+        &[
+            "create",
+            "packages",
+            "--prefix",
+            "/packages",
+            "--registry",
+            "https://registry.example",
+            "--repository",
+            "team/packages",
+        ],
+    );
+    assert_eq!(directory.status.code(), Some(74));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let target = temp.write_config(&valid_two_mount_config());
+        let symlink_path = temp.path.join("mounts-link.toml");
+        symlink(&target, &symlink_path).unwrap();
+        let original = fs::read(&target).unwrap();
+        let linked = run_mount(
+            &symlink_path,
+            &["update", "packages", "--prefix", "/changed"],
+        );
+        assert_eq!(linked.status.code(), Some(74));
+        assert!(
+            symlink_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).unwrap(), original);
+    }
 }
 
 #[test]
