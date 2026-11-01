@@ -631,6 +631,115 @@ repository = "team/releases"
 }
 
 #[tokio::test]
+async fn mount_artifact_and_serve_cli_complete_a_real_registry_demo_flow() {
+    let registry = TestRegistry::new(false);
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("demo.toml");
+    let requests_before_mount = registry.request_count("team/releases");
+    let mount = Command::new(cli_binary())
+        .args(["mount", "--config"])
+        .arg(&config_path)
+        .args([
+            "create",
+            "demo",
+            "--prefix",
+            "/demo",
+            "--registry",
+            &registry.base_url,
+            "--repository",
+            "team/releases",
+        ])
+        .output()
+        .unwrap();
+    let mount = assert_cli_success(mount);
+    let mount_json: serde_json::Value = serde_json::from_slice(&mount.stdout).unwrap();
+    assert_eq!(mount_json["name"], "demo");
+    assert_eq!(mount_json["registry"], registry.base_url);
+    assert_eq!(
+        registry.request_count("team/releases"),
+        requests_before_mount,
+        "mount CRUD must not contact the registry"
+    );
+
+    let input_path = scratch.path.join("payload.bin");
+    let expected = b"published by the CLI\0opaque=\xff";
+    fs::write(&input_path, expected).unwrap();
+    let create = artifact_cli(&registry, &config_path)
+        .args(["create", "/demo/releases/v1.bin", "--input"])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+    let create = assert_cli_success(create);
+    let created: serde_json::Value = serde_json::from_slice(&create.stdout).unwrap();
+    assert_eq!(created["path"], "/demo/releases/v1.bin");
+    assert_eq!(
+        curl_tree_file(&registry, &["releases", "v1.bin"]),
+        expected,
+        "independent registry reads must observe the CLI-published bytes"
+    );
+
+    let read = artifact_cli(&registry, &config_path)
+        .args(["read", "/demo/releases/v1.bin"])
+        .output()
+        .unwrap();
+    assert_eq!(assert_cli_success(read).stdout, expected);
+    let listing = parse_listing(
+        artifact_cli(&registry, &config_path)
+            .args(["list", "/demo/releases"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(listing[1]["name"], "v1.bin");
+
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+    let response = http_request(address, "GET", "/demo/releases/v1.bin", &[]).unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, expected);
+    let head = http_request(address, "HEAD", "/demo/releases/v1.bin", &[]).unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(
+        head.headers.get("content-length").unwrap(),
+        &expected.len().to_string()
+    );
+    let directory = http_request(address, "GET", "/demo/releases/", &[]).unwrap();
+    assert_eq!(directory.status, 200);
+    assert!(
+        String::from_utf8_lossy(&directory.body)
+            .contains("href=\"/demo/releases/v1.bin\">v1.bin</a>")
+    );
+
+    let delete = artifact_cli(&registry, &config_path)
+        .args(["delete", "/demo/releases/v1.bin"])
+        .output()
+        .unwrap();
+    assert_cli_success(delete);
+    let deleted_http = http_request(address, "GET", "/demo/releases/v1.bin", &[]).unwrap();
+    assert_eq!(deleted_http.status, 404);
+    let missing_cli = artifact_cli(&registry, &config_path)
+        .args(["read", "/demo/releases/v1.bin"])
+        .output()
+        .unwrap();
+    assert_eq!(missing_cli.status.code(), Some(66));
+    stop_http_server(&mut server);
+
+    let local_files = fs::read_dir(&scratch.path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        local_files,
+        [".demo.toml.oci-auto-http.lock", "demo.toml", "payload.bin"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
+        "the application must not create a local durable content catalog"
+    );
+}
+
+#[tokio::test]
 async fn serve_routes_real_requests_to_the_selected_mount_only() {
     let registry = TestRegistry::new(false);
     let scratch = TempDir::new();
