@@ -10,7 +10,7 @@ cargo test --locked
 cargo run -- --help
 ```
 
-The application exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact CRUD commands operate on OCI-backed tree paths; mount CRUD commands manage the version-1 TOML configuration without contacting a registry.
+The application exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact CRUD commands operate on OCI-backed tree paths; mount CRUD commands manage the version-1 TOML configuration without contacting a registry. For operator installation, systemd/Compose examples, backup/recovery guidance, health semantics, and pip/RPM/Debian static-tree examples, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md). The Linux release targets and CI workflows are listed there as well.
 
 Start the listener with a TOML configuration file:
 
@@ -85,6 +85,10 @@ Library callers can use `StoragePath::parse_relative` for already-decoded relati
 Use `--log-format text` (default) or `--log-format json` to select stderr logging. `RUST_LOG` controls the tracing filter; invalid filters fall back to `info`. Credentials and request data are not accepted as command-line arguments.
 
 Run `oci-auto-http <command> --help` for command-specific usage. Invalid command syntax exits `2`; mount CRUD only edits local configuration and makes no registry request.
+
+## Deployment and releases
+
+The repository includes a hardened loopback-only [`compose.yaml`](compose.yaml), a non-root [`Dockerfile`](Dockerfile), a systemd unit using `LoadCredential` (`deploy/oci-auto-http.service`), and a container TOML template. These are examples to review and edit for the deployment; none contains credentials or publishes a public listener by default. GitHub Actions tests the native build and cross-builds/smoke-tests x86_64, aarch64, and ARMv7 GNU/Linux. Tagged releases attach checksum-bearing binary archives. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md); cross/QEMU CI is not a physical ARM hardware performance test.
 
 ## Behavior tests
 

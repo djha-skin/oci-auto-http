@@ -1,0 +1,11 @@
+.git
+.github
+.beads
+.pi
+target
+
+# Local secrets/configuration must never enter the image build context.
+.env
+*.key
+*.pem
+config.toml

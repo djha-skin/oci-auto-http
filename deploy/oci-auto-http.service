@@ -1,0 +1,35 @@
+[Unit]
+Description=OCI-backed static HTTP service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oci-auto-http
+Group=oci-auto-http
+WorkingDirectory=/
+ExecStart=/usr/local/bin/oci-auto-http serve --config /etc/oci-auto-http/config.toml --tls-cert ${CREDENTIALS_DIRECTORY}/server-chain.pem --tls-key ${CREDENTIALS_DIRECTORY}/server-key.pem
+LoadCredential=server-chain.pem:/etc/oci-auto-http/tls/server-chain.pem
+LoadCredential=server-key.pem:/etc/oci-auto-http/tls/server-key.pem
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+UMask=0077
+MemoryMax=384M
+CPUQuota=100%
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -4,3 +4,7 @@
 *.db
 .beads-credential-key
 /target/
+/deploy/config.toml
+/deploy/server-chain.pem
+/deploy/server-key.pem
+/deploy/server-ca.pem

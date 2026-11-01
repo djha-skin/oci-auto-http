@@ -1,0 +1,29 @@
+version = 1
+
+[server]
+# Bind inside the container; compose.yaml publishes this port on host loopback only.
+listen = "0.0.0.0:8443"
+max_concurrent_requests = 32
+request_timeout_seconds = 300
+registry_request_timeout_seconds = 30
+stream_idle_timeout_seconds = 30
+graceful_shutdown_timeout_seconds = 30
+max_autoindex_spool_bytes = 16777216
+max_autoindex_spool_total_bytes = 268435456
+
+# These are illustrative anonymous, read-only public mounts. Replace every
+# registry/repository placeholder before starting the service. No credentials
+# belong in this file.
+[[mounts]]
+name = "wheels"
+prefix = "/wheels"
+registry = "https://registry.example.com"
+repository = "team/wheels"
+root_tag = "oci-auto-http-tree-v1"
+
+[[mounts]]
+name = "apt"
+prefix = "/debian"
+registry = "https://registry.example.com"
+repository = "team/debian"
+root_tag = "oci-auto-http-tree-v1"

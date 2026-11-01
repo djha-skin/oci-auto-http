@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Serve OCI-backed byte trees over HTTP"
+repository = "https://github.com/djha-skin/oci-auto-http"
+documentation = "https://docs.rs/oci-auto-http"
+exclude = [".beads/**", ".pi/**", ".github/**"]
 
 [[bin]]
 name = "oci-auto-http"
