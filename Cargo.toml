@@ -1,0 +1,19 @@
+[package]
+name = "oci-auto-http"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Serve OCI-backed byte trees over HTTP"
+
+[[bin]]
+name = "oci-auto-http"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+clap = { version = "4.6.6", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
