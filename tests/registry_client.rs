@@ -1,17 +1,19 @@
 #![cfg(unix)]
 
 use std::{
+    collections::HashMap,
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpListener as StdTcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{StreamExt, TryStreamExt};
@@ -624,6 +626,227 @@ repository = "team/releases"
 }
 
 #[tokio::test]
+async fn serve_routes_real_requests_to_the_selected_mount_only() {
+    let registry = TestRegistry::new(false);
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("serve.toml");
+    let config_text = format!(
+        r#"version = 1
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "{}"
+repository = "team/releases"
+
+[[mounts]]
+name = "mirror"
+prefix = "/mirror"
+registry = "{}"
+repository = "team/mirror"
+
+[[mounts]]
+name = "empty"
+prefix = "/empty"
+registry = "{}"
+repository = "team/empty"
+"#,
+        registry.base_url, registry.base_url, registry.base_url
+    );
+    fs::write(&config_path, &config_text).unwrap();
+    let config = Config::parse(Path::new("serve-test.toml"), &config_text).unwrap();
+    let certificate = fs::read(&registry.certificate).unwrap();
+    let policy = ClientPolicy::default().with_root_certificate_pem(&certificate);
+
+    let package_canary = b"packages repository canary\0\xff";
+    let mirror_canary = b"mirror repository canary\0\xfe";
+    let package_only = b"packages-only file";
+    let mirror_only = b"mirror-only file";
+    let encoded_name_bytes = b"encoded path canary";
+    for (mount_name, path, contents) in [
+        ("packages", "nested/canary.bin", package_canary.as_slice()),
+        (
+            "packages",
+            "nested/packages-only.bin",
+            package_only.as_slice(),
+        ),
+        (
+            "packages",
+            "nested/literal%2F+space ☃.bin",
+            encoded_name_bytes.as_slice(),
+        ),
+        ("mirror", "nested/canary.bin", mirror_canary.as_slice()),
+        ("mirror", "nested/mirror-only.bin", mirror_only.as_slice()),
+    ] {
+        let mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.name == mount_name)
+            .unwrap();
+        let client = RegistryClient::new(mount.clone(), policy.clone()).unwrap();
+        let tree = TreeStore::new(client).unwrap();
+        tree.write_file(
+            &StoragePath::parse_relative(path).unwrap(),
+            Bytes::copy_from_slice(contents),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let address = unused_http_address();
+    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+    wait_for_http_server(&mut server.child, address);
+
+    let package_before = registry.request_count("team/releases");
+    let mirror_before = registry.request_count("team/mirror");
+    let package_response =
+        http_request(address, "GET", "/packages/nested/canary.bin", &[]).unwrap();
+    assert_eq!(package_response.status, 200);
+    assert_eq!(package_response.body, package_canary);
+    assert_eq!(
+        package_response.headers.get("content-length").unwrap(),
+        &package_canary.len().to_string()
+    );
+    wait_for_registry_requests(&registry, "team/releases", package_before + 1);
+    assert_eq!(registry.request_count("team/mirror"), mirror_before);
+
+    let head = http_request(address, "HEAD", "/packages/nested/canary.bin", &[]).unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(
+        head.headers.get("content-length").unwrap(),
+        &package_canary.len().to_string()
+    );
+
+    let mirror_before = registry.request_count("team/mirror");
+    let package_before = registry.request_count("team/releases");
+    let mirror_response = http_request(address, "GET", "/mirror/nested/canary.bin", &[]).unwrap();
+    assert_eq!(mirror_response.status, 200);
+    assert_eq!(mirror_response.body, mirror_canary);
+    wait_for_registry_requests(&registry, "team/mirror", mirror_before + 1);
+    assert_eq!(registry.request_count("team/releases"), package_before);
+
+    let package_before_missing = registry.request_count("team/releases");
+    let mirror_before_missing = registry.request_count("team/mirror");
+    let package_only_path =
+        http_request(address, "GET", "/packages/nested/mirror-only.bin", &[]).unwrap();
+    assert_eq!(package_only_path.status, 404);
+    wait_for_registry_requests(&registry, "team/releases", package_before_missing + 1);
+    assert_eq!(registry.request_count("team/mirror"), mirror_before_missing);
+
+    let package_before_mirror_missing = registry.request_count("team/releases");
+    let mirror_before_mirror_missing = registry.request_count("team/mirror");
+    let mirror_only_path =
+        http_request(address, "GET", "/mirror/nested/packages-only.bin", &[]).unwrap();
+    assert_eq!(mirror_only_path.status, 404);
+    wait_for_registry_requests(&registry, "team/mirror", mirror_before_mirror_missing + 1);
+    assert_eq!(
+        registry.request_count("team/releases"),
+        package_before_mirror_missing
+    );
+
+    let encoded = http_request(
+        address,
+        "GET",
+        "/packages/nested/literal%252F+space%20%E2%98%83.bin",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(encoded.status, 200);
+    assert_eq!(encoded.body, encoded_name_bytes);
+
+    let directory_redirect =
+        http_request(address, "GET", "/packages/nested?do-not-copy=private", &[]).unwrap();
+    assert_eq!(directory_redirect.status, 301);
+    assert_eq!(
+        directory_redirect.headers.get("location").unwrap(),
+        "/packages/nested/"
+    );
+    let directory_page = http_request(address, "GET", "/packages/nested/", &[]).unwrap();
+    assert_eq!(directory_page.status, 501);
+    let file_with_slash =
+        http_request(address, "GET", "/packages/nested/canary.bin/", &[]).unwrap();
+    assert_eq!(file_with_slash.status, 404);
+
+    let package_before_invalid = registry.request_count("team/releases");
+    let mirror_before_invalid = registry.request_count("team/mirror");
+    for path in [
+        "/packages/nested/a%2Fb",
+        "/packages/%2e%2e/secret",
+        "/packages/%FF",
+        "/packages/nested//file",
+        "/packages/nested/%5Cfile",
+        "/packages/%",
+    ] {
+        let response = http_request(address, "GET", path, &[]).unwrap();
+        assert_eq!(response.status, 400, "path {path}: {response:?}");
+    }
+    for (method, path) in [
+        ("GET", "/packages-old/nested/canary.bin"),
+        ("GET", "/unmounted/file"),
+    ] {
+        let response = http_request(address, method, path, &[]).unwrap();
+        assert_eq!(response.status, 404, "{method} {path}: {response:?}");
+    }
+    let unsupported = http_request(address, "POST", "/packages/nested/canary.bin", &[]).unwrap();
+    assert_eq!(unsupported.status, 405);
+    assert_eq!(unsupported.headers.get("allow").unwrap(), "GET, HEAD");
+
+    let unauthorized = http_request(
+        address,
+        "GET",
+        "/packages/nested/canary.bin",
+        &[("Authorization", "Bearer do-not-forward-this")],
+    )
+    .unwrap();
+    assert_eq!(unauthorized.status, 403);
+    assert!(!String::from_utf8_lossy(&unauthorized.body).contains("do-not-forward-this"));
+    let duplicate_authorization = http_request(
+        address,
+        "GET",
+        "/packages/nested/canary.bin",
+        &[
+            ("Authorization", "Bearer first-secret"),
+            ("Authorization", "Bearer second-secret"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(duplicate_authorization.status, 400);
+    assert_eq!(
+        registry.request_count("team/releases"),
+        package_before_invalid
+    );
+    assert_eq!(registry.request_count("team/mirror"), mirror_before_invalid);
+
+    let empty_before = registry.request_count("team/empty");
+    let empty_root = http_request(address, "GET", "/empty/missing", &[]).unwrap();
+    assert_eq!(empty_root.status, 503);
+    wait_for_registry_requests(&registry, "team/empty", empty_before + 1);
+    let empty_mount = config
+        .mounts
+        .iter()
+        .find(|mount| mount.name == "empty")
+        .unwrap();
+    let empty_client = RegistryClient::new(empty_mount.clone(), policy).unwrap();
+    assert_eq!(
+        empty_client
+            .resolve_tag(&empty_mount.root_tag, &[OCI_IMAGE_INDEX], None)
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound,
+        "GET on an absent root must not initialize the tree"
+    );
+
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains("do-not-forward-this"));
+    assert!(!stderr.contains("first-secret"));
+    assert!(!stderr.contains("second-secret"));
+}
+
+#[tokio::test]
 async fn tree_concurrent_writers_and_pinned_listing_cursor_preserve_snapshots() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -941,6 +1164,153 @@ fn curl_tree_file(registry: &TestRegistry, path: &[&str]) -> Vec<u8> {
     registry.curl_api(&format!("blobs/{layer_digest}"), None)
 }
 
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn http_request(
+    address: SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> io::Result<HttpResponse> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(stream, "{method} {target} HTTP/1.1\r\nHost: localhost\r\n")?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    stream.write_all(b"Connection: close\r\n\r\n")?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("HTTP response omitted its header terminator"))?;
+    let header_text = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| io::Error::other("HTTP response headers were not UTF-8"))?;
+    let mut lines = header_text.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| io::Error::other("HTTP response status was malformed"))?;
+    let mut response_headers = HashMap::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            response_headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+    Ok(HttpResponse {
+        status,
+        headers: response_headers,
+        body: raw[header_end + 4..].to_vec(),
+    })
+}
+
+struct RunningHttpServer {
+    child: Child,
+    stopped: bool,
+}
+
+impl Drop for RunningHttpServer {
+    fn drop(&mut self) {
+        if !self.stopped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_http_server(config: &Path, certificate: &Path, address: SocketAddr) -> RunningHttpServer {
+    let child = Command::new(cli_binary())
+        .args(["--log-format", "json", "serve", "--config"])
+        .arg(config)
+        .args(["--ca-cert"])
+        .arg(certificate)
+        .args(["--listen", &address.to_string()])
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    RunningHttpServer {
+        child,
+        stopped: false,
+    }
+}
+
+fn wait_for_http_server(child: &mut Child, address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            panic!("HTTP server exited before readiness: {status}; stderr: {stderr}");
+        }
+        if http_request(address, "GET", "/healthz", &[])
+            .is_ok_and(|response| response.status == 204)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTP server did not become ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stop_http_server(server: &mut RunningHttpServer) -> String {
+    let signal = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        signal.success(),
+        "could not send SIGTERM to HTTP test server"
+    );
+    let status = server.child.wait().unwrap();
+    server.stopped = true;
+    let mut stderr = String::new();
+    server
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "HTTP test server exited unsuccessfully");
+    stderr
+}
+
+fn unused_http_address() -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+fn wait_for_registry_requests(registry: &TestRegistry, repository: &str, minimum: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let count = registry.request_count(repository);
+        if count >= minimum {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registry {repository} logged {count} matching requests; expected at least {minimum}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 struct TestRegistry {
     container: String,
     _cleanup: ContainerGuard,
@@ -1083,6 +1453,20 @@ impl TestRegistry {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    fn request_count(&self, repository: &str) -> usize {
+        let output = Command::new("docker")
+            .args(["logs", &self.container])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "docker logs failed");
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        logs.matches(&format!("/v2/{repository}/")).count()
     }
 }
 
