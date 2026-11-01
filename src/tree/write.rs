@@ -8,8 +8,8 @@ use sha2::{Digest as _, Sha256};
 use crate::registry::{Digest, ErrorKind, ManifestReference, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST};
 
 use super::{
-    MAX_INDEX_BYTES, MAX_INDEX_DEPTH, MAX_INDEX_DESCRIPTORS, PageRef, StoragePath, TreeError,
-    TreeStore,
+    MAX_INDEX_BYTES, MAX_INDEX_DEPTH, MAX_INDEX_DESCRIPTORS, MAX_ROOT_PROMOTION_PAGES, PageRef,
+    StoragePath, TreeError, TreeStore,
     format::{
         FILE_CONFIG_MEDIA_TYPE, FILE_DATA_MEDIA_TYPE, FileConfig, FileManifest, IndexKind,
         OciDescriptor, OciIndex,
@@ -609,6 +609,10 @@ impl TreeStore {
         roots: &[PageRef],
         authorization: Option<&HeaderValue>,
     ) -> Result<usize, TreeError> {
+        if roots.len() > MAX_ROOT_PROMOTION_PAGES {
+            return Err(TreeError::IndexPageScanLimit);
+        }
+        let mut scheduled = roots.len();
         let mut max_depth = 0;
         let mut visited = HashSet::new();
         let mut pages = roots
@@ -630,7 +634,12 @@ impl TreeStore {
                 if depth == MAX_INDEX_DEPTH {
                     return Err(TreeError::IndexDepthLimit);
                 }
-                for descriptor in index.manifests {
+                let children = index.manifests;
+                scheduled = scheduled
+                    .checked_add(children.len())
+                    .filter(|scheduled| *scheduled <= MAX_ROOT_PROMOTION_PAGES)
+                    .ok_or(TreeError::IndexPageScanLimit)?;
+                for descriptor in children {
                     pages.push((page_ref_from_branch_child(descriptor)?, depth + 1));
                 }
             }

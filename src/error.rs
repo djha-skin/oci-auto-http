@@ -101,7 +101,8 @@ fn tree_exit_code(error: &TreeError) -> u8 {
         TreeError::InvalidFileSize
         | TreeError::InvalidFileContent
         | TreeError::IntegrityError
-        | TreeError::IndexDepthLimit => 65,
+        | TreeError::IndexDepthLimit
+        | TreeError::IndexPageScanLimit => 65,
         TreeError::Registry(error) => registry_exit_code(error),
         TreeError::InvalidMountTarget => 78,
         TreeError::InputStream => 74,

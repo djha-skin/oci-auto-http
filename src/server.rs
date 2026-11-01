@@ -667,6 +667,10 @@ fn tree_error_response(error: TreeError, secure_client: bool) -> Response {
         Some(_) => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
         None => match &error {
             TreeError::InvalidPath => (StatusCode::BAD_REQUEST, "invalid path\n"),
+            TreeError::IndexPageScanLimit => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "tree exceeds the supported mutation page-scan limit\n",
+            ),
             TreeError::NotFound => (StatusCode::NOT_FOUND, "not found\n"),
             TreeError::MissingRoot => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n"),
             TreeError::IsDirectory | TreeError::NotDirectory | TreeError::NotFile => {

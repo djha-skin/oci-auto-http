@@ -33,6 +33,7 @@ const MAX_PATH_COMPONENTS: usize = 128;
 const MAX_INDEX_DESCRIPTORS: usize = 128;
 const MAX_INDEX_BYTES: usize = 1_048_576;
 pub(super) const MAX_INDEX_DEPTH: usize = 64;
+pub(super) const MAX_ROOT_PROMOTION_PAGES: usize = 256;
 pub(super) const MAX_LISTING_PAGE_SIZE: usize = 10_000;
 const MAX_FILE_CONFIG_BYTES: usize = 16 * 1_024;
 
@@ -67,6 +68,8 @@ pub enum TreeError {
     IntegrityError,
     #[error("OCI directory index exceeds the maximum supported branch depth")]
     IndexDepthLimit,
+    #[error("OCI directory index exceeds the root-promotion page scan budget")]
+    IndexPageScanLimit,
     #[error("invalid directory-list continuation token")]
     InvalidCursor,
     #[error("invalid directory-list page size")]

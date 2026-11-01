@@ -3334,6 +3334,125 @@ async fn tree_refuses_root_promotion_that_would_deepen_an_untouched_sibling() {
 }
 
 #[tokio::test]
+async fn tree_rejects_over_budget_root_promotion_without_publishing() {
+    const CHILDREN_PER_BRANCH: usize = 128;
+    const WIDE_BRANCHES: usize = 3;
+    const DIRECT_CHILDREN: usize = 125;
+    const ENTRY_NAME: &str = "io.github.djha-skin.oci-auto-http.entry-name";
+    const FIRST_NAME: &str = "io.github.djha-skin.oci-auto-http.first-name";
+    const LAST_NAME: &str = "io.github.djha-skin.oci-auto-http.last-name";
+
+    let registry = TestRegistry::new(false);
+    let client = registry.client(ClientPolicy::default());
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(
+        &StoragePath::parse_relative("seed.txt").unwrap(),
+        Bytes::from_static(b"shared file manifest"),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let seed_root = client
+        .get_manifest(
+            &ManifestReference::Tag(registry.mount.root_tag.clone()),
+            &[OCI_IMAGE_INDEX],
+            None,
+        )
+        .await
+        .unwrap();
+    let seed_index: serde_json::Value = serde_json::from_slice(&seed_root.bytes).unwrap();
+    let seed_file = descriptor_named(&seed_index, "seed.txt", ENTRY_NAME);
+    let shared_file_digest = Digest::parse(seed_file["digest"].as_str().unwrap()).unwrap();
+    let shared_file_size = seed_file["size"].as_u64().unwrap();
+    drop(tree);
+
+    let mut root_children = Vec::with_capacity(128);
+    for group in 0..WIDE_BRANCHES {
+        let mut branch_children = Vec::with_capacity(CHILDREN_PER_BRANCH);
+        for leaf in 0..CHILDREN_PER_BRANCH {
+            let names = if group == 0 && leaf == 0 {
+                (0..CHILDREN_PER_BRANCH)
+                    .map(|entry| format!("g{group:03}-l{leaf:03}-a{entry:03}"))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![format!("g{group:03}-l{leaf:03}-file")]
+            };
+            let first = names.first().unwrap().clone();
+            let last = names.last().unwrap().clone();
+            let descriptors = names
+                .into_iter()
+                .map(|name| {
+                    test_file_descriptor(&DirectoryEntry {
+                        name,
+                        kind: EntryKind::File,
+                        digest: shared_file_digest.clone(),
+                        size: shared_file_size,
+                    })
+                })
+                .collect();
+            let (digest, size) = put_test_index(&client, test_leaf_index(descriptors)).await;
+            branch_children.push(test_branch_descriptor(&digest, size, &first, &last));
+        }
+        let first = branch_children[0]["annotations"][FIRST_NAME]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let last = branch_children.last().unwrap()["annotations"][LAST_NAME]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (digest, size) = put_test_index(&client, test_branch_index(branch_children)).await;
+        root_children.push(test_branch_descriptor(&digest, size, &first, &last));
+    }
+    for group in WIDE_BRANCHES..(WIDE_BRANCHES + DIRECT_CHILDREN) {
+        let name = format!("g{group:03}-file");
+        let descriptor = test_file_descriptor(&DirectoryEntry {
+            name: name.clone(),
+            kind: EntryKind::File,
+            digest: shared_file_digest.clone(),
+            size: shared_file_size,
+        });
+        let (digest, size) = put_test_index(&client, test_leaf_index(vec![descriptor])).await;
+        root_children.push(test_branch_descriptor(&digest, size, &name, &name));
+    }
+    assert_eq!(root_children.len(), 128);
+
+    let root_bytes = test_branch_index(root_children);
+    let root_digest = Digest::from_bytes(&root_bytes);
+    client
+        .put_manifest(
+            &ManifestReference::Tag(registry.mount.root_tag.clone()),
+            OCI_IMAGE_INDEX,
+            Bytes::from(root_bytes),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let path = StoragePath::parse_relative("g000-l000-a064x").unwrap();
+    let error = tree
+        .write_file(&path, Bytes::from_static(b"must not publish"), false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TreeError::IndexPageScanLimit));
+    assert_eq!(
+        client
+            .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+            .await
+            .unwrap()
+            .digest,
+        root_digest,
+        "an over-budget promotion must not publish a new root"
+    );
+    assert!(matches!(
+        tree.stat_file(&path, None).await,
+        Err(TreeError::NotFound)
+    ));
+}
+
+#[tokio::test]
 async fn tree_failed_content_stream_does_not_publish_a_new_root() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
