@@ -210,6 +210,10 @@ impl fmt::Debug for RegistryClient {
 }
 
 impl RegistryClient {
+    pub(crate) fn mount(&self) -> &Mount {
+        &self.mount
+    }
+
     pub fn new(mount: Mount, policy: ClientPolicy) -> Result<Self, RegistryError> {
         if mount.registry.scheme() != "https"
             || mount.registry.host_str().is_none()
@@ -943,7 +947,7 @@ where
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.error = Some(ErrorKind::Transport);
+                state.error = Some(ErrorKind::UploadSource);
                 Poll::Ready(Some(Err(io::Error::other("blob source failed"))))
             }
             Poll::Ready(Some(Ok(bytes))) => {
@@ -1073,6 +1077,7 @@ pub enum ErrorKind {
     ResponseTooLarge,
     DigestMismatch,
     SizeMismatch,
+    UploadSource,
     RedirectDenied,
     PaginationLimit,
 }
