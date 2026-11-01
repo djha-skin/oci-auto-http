@@ -29,7 +29,6 @@ use oci_auto_http::{
     },
     tree::{DirectoryEntry, EntryKind, StoragePath, TreeError, TreeStore},
 };
-#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 #[cfg(target_os = "linux")]
 use std::io::{BufRead, BufReader};
@@ -43,6 +42,111 @@ use url::Url;
 const REGISTRY_IMAGE: &str = "registry:2";
 const TEST_PASSWORD: &str = "test";
 const BASIC_AUTH: &str = "Basic dGVzdDp0ZXN0";
+
+#[tokio::test]
+#[ignore = "requires explicit OCI_EXT_MATRIX provider configuration and credentials"]
+async fn external_registry_matrix_performs_read_only_tree_probes() {
+    let selected = std::env::var("OCI_EXT_MATRIX")
+        .expect("set OCI_EXT_MATRIX to a comma-separated list of configured providers");
+    let mut count = 0;
+    for provider in selected
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        assert!(
+            ["ghcr", "dockerhub", "ecr"].contains(&provider),
+            "unsupported external provider selector"
+        );
+        external_registry_probe(provider).await;
+        count += 1;
+    }
+    assert!(count > 0, "OCI_EXT_MATRIX did not select a provider");
+}
+
+async fn external_registry_probe(provider: &str) {
+    let prefix = format!("OCI_EXT_{}", provider.to_ascii_uppercase());
+    let required = |suffix: &str| {
+        std::env::var(format!("{prefix}_{suffix}"))
+            .unwrap_or_else(|_| panic!("missing required {prefix}_{suffix} setting"))
+    };
+    let registry = required("REGISTRY");
+    let repository = required("REPOSITORY");
+    let root_tag = required("ROOT_TAG");
+    let path = required("PATH");
+    let expected_digest = Digest::parse(&required("EXPECTED_SHA256"))
+        .unwrap_or_else(|_| panic!("invalid expected digest for external provider {provider}"));
+    let authorization = std::env::var(format!("{prefix}_AUTHORIZATION"))
+        .ok()
+        .map(|value| {
+            HeaderValue::from_str(&value)
+                .unwrap_or_else(|_| panic!("invalid Authorization field for provider {provider}"))
+        });
+    let redirects = std::env::var(format!("{prefix}_REDIRECT_ALLOWLIST"))
+        .ok()
+        .map(|value| {
+            toml::Value::Array(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|authority| !authority.is_empty())
+                    .map(|authority| toml::Value::String(authority.to_owned()))
+                    .collect(),
+            )
+            .to_string()
+        })
+        .unwrap_or_else(|| "[]".to_owned());
+    let config_text = format!(
+        "version = 1\n[[mounts]]\nname = \"external\"\nprefix = \"/external\"\nregistry = {}\nrepository = {}\nroot_tag = {}\nredirect_allowlist = {}\n",
+        toml::Value::String(registry),
+        toml::Value::String(repository),
+        toml::Value::String(root_tag),
+        redirects
+    );
+    let config = Config::parse(Path::new("external-read-only-probe.toml"), &config_text)
+        .unwrap_or_else(|_| panic!("invalid external provider {provider} configuration"));
+    let mut policy = ClientPolicy::default();
+    if let Ok(certificate_path) = std::env::var(format!("{prefix}_CA_CERT")) {
+        let certificate = fs::read(certificate_path)
+            .unwrap_or_else(|_| panic!("could not read CA certificate for provider {provider}"));
+        assert!(
+            certificate.len() <= 1024 * 1024,
+            "provider CA certificate is too large"
+        );
+        policy = policy.with_root_certificate_pem(&certificate);
+    }
+    let client = RegistryClient::new(config.mounts[0].clone(), policy)
+        .unwrap_or_else(|_| panic!("could not configure external provider {provider}"));
+    let tree = TreeStore::new(client).unwrap();
+    let path = StoragePath::parse_relative(&path)
+        .unwrap_or_else(|_| panic!("invalid probe path for external provider {provider}"));
+    let file = tree
+        .read_file(&path, authorization.as_ref())
+        .await
+        .unwrap_or_else(|_| panic!("read-only tree probe failed for external provider {provider}"));
+    let (hasher, size) = file
+        .body
+        .try_fold(
+            (Sha256::new(), 0_u64),
+            |(mut hasher, size), chunk| async move {
+                let size = size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(TreeError::InvalidFileSize)?;
+                hasher.update(&chunk);
+                Ok::<_, TreeError>((hasher, size))
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("verified byte stream failed for external provider {provider}"));
+    let received_digest = Digest::parse(&format!("sha256:{:x}", hasher.finalize())).unwrap();
+    assert_eq!(
+        received_digest, expected_digest,
+        "provider {provider} content digest mismatch"
+    );
+    println!(
+        "external provider {provider}: read-only OCI tree probe passed (version not determined, size {size})"
+    );
+}
 
 #[tokio::test]
 async fn distribution_round_trip_matches_independent_registry_reads_and_tag_listing() {
