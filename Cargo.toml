@@ -38,6 +38,7 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 sha2 = "0.10.9"
 base64 = "0.22.1"
 ring = "0.17.14"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "fs", "io-util", "io-std"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tempfile = "3.27.0"

@@ -1,5 +1,7 @@
+mod artifact;
+
 use crate::{
-    cli::{ArtifactCommand, Command, MountCommand},
+    cli::{Command, MountCommand},
     server,
 };
 use oci_auto_http::error::AppError;
@@ -7,15 +9,7 @@ use oci_auto_http::error::AppError;
 pub async fn run(command: Command) -> Result<(), AppError> {
     match command {
         Command::Serve(args) => server::serve(args).await,
-        Command::Artifact { command } => Err(AppError::NotImplemented {
-            command: match command {
-                ArtifactCommand::Create { .. } => "artifact create",
-                ArtifactCommand::Read { .. } => "artifact read",
-                ArtifactCommand::List { .. } => "artifact list",
-                ArtifactCommand::Update { .. } => "artifact update",
-                ArtifactCommand::Delete { .. } => "artifact delete",
-            },
-        }),
+        Command::Artifact(args) => artifact::run(args).await,
         Command::Mount { command } => Err(AppError::NotImplemented {
             command: match command {
                 MountCommand::Create { .. } => "mount create",

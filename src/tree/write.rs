@@ -25,6 +25,13 @@ enum EntryOperation {
     Remove,
 }
 
+#[derive(Clone, Copy)]
+enum WriteMode {
+    CreateOnly,
+    Upsert,
+    Replace,
+}
+
 impl TreeStore {
     /// Create or replace a file, creating missing parents in the same root-tag
     /// publication. Identical content is a no-op that preserves the root digest.
@@ -58,6 +65,57 @@ impl TreeStore {
     where
         S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
     {
+        self.write_file_stream_with_requirement(
+            path,
+            content_digest,
+            size,
+            source,
+            if overwrite {
+                WriteMode::Upsert
+            } else {
+                WriteMode::CreateOnly
+            },
+            authorization,
+        )
+        .await
+    }
+
+    /// Replace an existing file without creating a new path if it is absent.
+    /// The existence check and replacement are serialized under the tree writer lock.
+    pub async fn replace_file_stream<S>(
+        &self,
+        path: &StoragePath,
+        content_digest: Digest,
+        size: u64,
+        source: S,
+        authorization: Option<&HeaderValue>,
+    ) -> Result<Digest, TreeError>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    {
+        self.write_file_stream_with_requirement(
+            path,
+            content_digest,
+            size,
+            source,
+            WriteMode::Replace,
+            authorization,
+        )
+        .await
+    }
+
+    async fn write_file_stream_with_requirement<S>(
+        &self,
+        path: &StoragePath,
+        content_digest: Digest,
+        size: u64,
+        source: S,
+        mode: WriteMode,
+        authorization: Option<&HeaderValue>,
+    ) -> Result<Digest, TreeError>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    {
         if size > i64::MAX as u64 {
             return Err(TreeError::InvalidFileSize);
         }
@@ -77,7 +135,7 @@ impl TreeStore {
                 return Err(TreeError::IsDirectory);
             }
             Ok(existing) if existing.media_type == OCI_IMAGE_MANIFEST => {
-                if !overwrite {
+                if matches!(mode, WriteMode::CreateOnly) {
                     return Err(TreeError::AlreadyExists);
                 }
                 let current = self.file_layer_descriptor(&existing, authorization).await?;
@@ -95,6 +153,9 @@ impl TreeStore {
                 }
             }
             Ok(_) => return Err(TreeError::IntegrityError),
+            Err(TreeError::NotFound) if matches!(mode, WriteMode::Replace) => {
+                return Err(TreeError::NotFound);
+            }
             Err(TreeError::NotFound) => {}
             Err(error) => return Err(error),
         }
@@ -153,7 +214,7 @@ impl TreeStore {
                 name,
                 &EntryOperation::Put {
                     descriptor: entry,
-                    require_absent: !overwrite,
+                    require_absent: matches!(mode, WriteMode::CreateOnly),
                 },
                 true,
                 authorization,

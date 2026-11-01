@@ -10,7 +10,7 @@ cargo test --locked
 cargo run -- --help
 ```
 
-The current foundation exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact and mount CRUD verbs are reserved in the CLI and return an actionable “not available yet” error until their storage features land; they do not contact a registry or create local artifact state.
+The foundation exposes the stable command groups `serve`, `artifact`, and `mount`. Artifact CRUD commands now operate on OCI-backed tree paths using a version-1 TOML mount configuration. Mount CRUD verbs remain reserved and return an actionable “not available yet” error without contacting a registry.
 
 Start the listener with a TOML configuration file:
 
@@ -32,13 +32,31 @@ The crate exposes `oci_auto_http::registry::RegistryClient` for repository-scope
 
 The module re-exports `Bytes`, `Stream`, and `HeaderValue` for callers of these APIs. Pass an optional `registry::HeaderValue` Authorization value to an operation. It is sent only to the configured HTTPS registry origin and is never forwarded to an allowlisted blob redirect. Configured-registry 401 challenges and `Retry-After` are exposed on `RegistryError` for exact HTTP relay; responses from allowlisted blob stores suppress those relay fields. Error `Display` and `Debug` omit headers, URLs, and response bodies. Blob GET returns a streaming body that checks the descriptor digest and size when fully consumed; blob uploads stream through an OCI PATCH session, verify the declared digest/size, then finalize with a separate PUT. Buffered manifests and tag pages are bounded (1 MiB by default, configurable up to 16 MiB); GET/HEAD use at most two retries by default, all writes are non-retryable, requests time out after 30 seconds, and blob redirects are manually constrained to HTTPS and exact configured authorities. Private-registry CA certificates can be supplied through `ClientPolicy::with_root_certificate_pem`.
 
-This library boundary is not yet wired into the `serve`, `artifact`, or `mount` commands; those integrations follow in the storage and routing work. End-to-end CLI/service validation is tracked as `oci-auto-http-idq`, dependent on the R3/R4 storage, command, and routing features. The currently implemented listener still returns `503` for mounted paths.
+The OCI client and tree library are wired into the `artifact` commands, but not yet into `serve` or `mount`. End-to-end CLI/service validation is tracked as `oci-auto-http-idq`, dependent on the R3/R4 storage, command, and routing features. The currently implemented listener still returns `503` for mounted paths.
+
+## Artifact commands
+
+Every artifact command requires `--config FILE`. Paths are absolute served URL paths, matched against a configured mount prefix and percent-decoded exactly once (`+` remains a literal plus). For example:
+
+```sh
+cargo run -- artifact --config ./config.toml create /packages/hello.txt --input ./hello.txt
+cargo run -- artifact --config ./config.toml read /packages/hello.txt --output ./downloaded.txt
+cargo run -- artifact --config ./config.toml list /packages
+cargo run -- artifact --config ./config.toml update /packages/hello.txt --input ./replacement.txt
+cargo run -- artifact --config ./config.toml delete /packages/hello.txt
+```
+
+`create` refuses to replace an existing path and creates missing parent directories; use `--directory` to create an empty directory. `--input FILE` selects file input; omit it or pass `-` to read standard input. `update` replaces an existing file only. `read` writes to standard output by default or atomically replaces `--output FILE` only after the streamed blob digest and size verify. `list` emits one JSON object with the pinned root digest, entries, and optional continuation cursor; its page size defaults to 1000 and is configurable with `--limit`. When the configuration has multiple mounts, pass a path to identify the mount. `delete --recursive` is required for non-empty directories.
+
+Input and output are streamed with bounded memory; standard input is staged in a temporary file so its digest and size can be verified before upload. `--ca-cert FILE` supplies an additional PEM CA certificate for a private registry. These commands currently use anonymous registry access; `--ca-cert` configures TLS trust, not registry credentials. Mutations to the same tree from separate CLI processes or services must be externally serialized; OCI tag updates do not provide portable compare-and-swap.
+
+Stable exit codes: `2` usage/config/path errors, `65` integrity/content validation, `66` missing paths, `69` reserved commands, `70` internal errors, `73` conflicts, `74` registry/I/O failures, `75` stale cursors or uncertain commits, `77` authorization failures, and `78` invalid mount targets.
 
 ## OCI tree storage library
 
 `oci_auto_http::tree::TreeStore` implements the version-1 OCI tree format over a validated `RegistryClient`. Call `initialize` to create the empty root explicitly; the first file or directory creation also initializes it, while reads and listings never initialize or repair an absent/corrupt tree. `stat_file` resolves verified file metadata without downloading the data layer, while `read_file` returns a digest/size-verified stream. `write_file` is a byte-buffer convenience API; `write_file_stream` accepts a byte stream plus its expected digest/size for bounded-memory uploads and verifies the stream even on a no-op. Both create missing parent directories and can replace a file; identical content is a no-op that preserves the root digest. `create_directory` makes an empty directory. `remove(path, recursive, auth)` deletes a file or directory in one root publication; nonempty directories require `recursive = true`. Deleted manifests and blobs are not removed from the registry because they may be shared; they become unreachable from the root.
 
-Use `StoragePath::parse_relative` for already-decoded CLI paths, or `StoragePath::from_components` when the HTTP router has decoded request path components exactly once. `list_page` accepts limits from 1 through 10,000, returns sorted immediate children, and issues opaque continuation tokens bound to the pinned root digest, directory, limit, and last name. Tokens are HMAC-protected using a process-local key, so they are valid only while that process remains running. Tree errors distinguish invalid paths, missing entries, integrity failures, invalid/stale cursors, and ambiguous root publication. A process-local per-target lock serializes writers; external writers still require coordination or read-only operation.
+Library callers can use `StoragePath::parse_relative` for already-decoded relative paths or `StoragePath::from_components` after decoding request components exactly once. `list_page` accepts limits from 1 through 10,000, returns sorted immediate children, and issues opaque continuation tokens bound to the pinned root digest, directory, limit, and last name. Tokens are HMAC-protected using a process-local key, so they are valid only while that process remains running. Tree errors distinguish invalid paths, missing entries, integrity failures, invalid/stale cursors, and ambiguous root publication. A process-local per-target lock serializes writers; external writers still require coordination or read-only operation.
 
 Use `--log-format text` (default) or `--log-format json` to select stderr logging. `RUST_LOG` controls the tracing filter; invalid filters fall back to `info`. Credentials and request data are not accepted as command-line arguments.
 

@@ -145,13 +145,13 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
     assert!(String::from_utf8_lossy(&missing_mount_options.stderr).contains("required"));
 
     let reserved = Command::new(binary())
-        .args(["artifact", "create", "sample"])
+        .args(["mount", "list"])
         .output()
         .unwrap();
     assert_eq!(reserved.status.code(), Some(69));
     let diagnostic = String::from_utf8_lossy(&reserved.stderr);
     assert!(
-        diagnostic.contains("artifact create is not available yet"),
+        diagnostic.contains("mount list is not available yet"),
         "unexpected reserved-command diagnostic: {diagnostic}"
     );
     assert!(
@@ -160,18 +160,15 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
     );
 
     let filtered = Command::new(binary())
-        .args(["artifact", "create", "sample"])
+        .args(["mount", "list"])
         .env("RUST_LOG", "off")
         .output()
         .unwrap();
     assert_eq!(filtered.status.code(), Some(69));
-    assert!(
-        String::from_utf8_lossy(&filtered.stderr)
-            .contains("error: artifact create is not available yet")
-    );
+    assert!(String::from_utf8_lossy(&filtered.stderr).contains("mount list is not available yet"));
 
     let json = Command::new(binary())
-        .args(["--log-format", "json", "artifact", "create", "sample"])
+        .args(["--log-format", "json", "mount", "list"])
         .env("RUST_LOG", "off")
         .output()
         .unwrap();
@@ -188,6 +185,26 @@ fn invalid_arguments_and_reserved_commands_fail_actionably() {
             .unwrap()
             .contains("no registry request was made")
     );
+
+    let missing_config = Command::new(binary())
+        .args(["artifact", "create", "/packages/file"])
+        .output()
+        .unwrap();
+    assert_eq!(missing_config.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_config.stderr).contains("--config"));
+
+    let create_help = Command::new(binary())
+        .args(["artifact", "create", "--help"])
+        .output()
+        .unwrap();
+    assert!(create_help.status.success());
+    let help = String::from_utf8(create_help.stdout).unwrap();
+    for option in ["--config", "--input", "--directory"] {
+        assert!(
+            help.contains(option),
+            "artifact create help omitted {option}: {help}"
+        );
+    }
 }
 
 #[test]
