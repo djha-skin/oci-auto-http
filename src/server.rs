@@ -1,10 +1,14 @@
+mod auth;
 mod file;
 
 use std::{
     fs::File,
+    future::Future,
     io::{self, Read},
     path::Path,
+    pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -15,24 +19,36 @@ use axum::{
     middleware::{self, Next},
     response::Response,
     routing::get,
+    serve::Listener,
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use oci_auto_http::{
     config::{Config, ResolvedPath},
     error::AppError,
     registry::{ClientPolicy, ErrorKind, RegistryClient},
     tree::{TreeError, TreeStore},
 };
-use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::cli::ServeArgs;
 
 const MAX_CA_CERT_BYTES: u64 = 1024 * 1024;
+const MAX_TLS_MATERIAL_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct ServeState {
     config: Config,
     stores: Vec<TreeStore>,
+    secure_listener: bool,
 }
 
 pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
@@ -40,6 +56,12 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     if let Some(listen) = args.listen {
         config.listen = listen;
     }
+    let tls_acceptor = match (args.tls_cert.as_deref(), args.tls_key.as_deref()) {
+        (Some(certificate), Some(key)) => Some(load_tls_acceptor(certificate, key)?),
+        (None, None) => None,
+        _ => return Err(AppError::InvalidTlsMaterial),
+    };
+    let secure_listener = tls_acceptor.is_some();
 
     let mut policy = ClientPolicy::default();
     if let Some(certificate_path) = args.ca_cert {
@@ -54,7 +76,11 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
             Ok(TreeStore::new(registry)?)
         })
         .collect::<Result<Vec<_>, AppError>>()?;
-    let state = Arc::new(ServeState { config, stores });
+    let state = Arc::new(ServeState {
+        config,
+        stores,
+        secure_listener,
+    });
 
     let listener = TcpListener::bind(state.config.listen)
         .await
@@ -67,32 +93,166 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     let app = Router::new()
         .route("/healthz", get(health).head(health))
         .fallback(route_request)
-        .layer(middleware::from_fn(reject_cleartext_authorization))
+        .layer(middleware::from_fn_with_state(
+            secure_listener,
+            enforce_authorization_transport,
+        ))
         .with_state(state.clone());
 
-    info!(%address, mounts = state.config.mounts.len(), "HTTP listener started");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(AppError::Serve)?;
+    if let Some(acceptor) = tls_acceptor {
+        info!(%address, mounts = state.config.mounts.len(), "HTTPS listener started");
+        axum::serve(HttpsListener::new(listener, acceptor), app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(AppError::Serve)?;
+    } else {
+        info!(%address, mounts = state.config.mounts.len(), "HTTP listener started");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(AppError::Serve)?;
+    }
     info!(%address, "HTTP listener stopped");
     Ok(())
 }
 
-async fn reject_cleartext_authorization(request: Request<Body>, next: Next) -> Response {
+async fn enforce_authorization_transport(
+    State(secure_listener): State<bool>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let method = request.method().clone();
     let mut authorization = request.headers().get_all(header::AUTHORIZATION).iter();
     if authorization.next().is_some() {
         let response = if authorization.next().is_some() {
             error_response(StatusCode::BAD_REQUEST, "invalid request\n")
-        } else {
-            // This listener currently accepts cleartext HTTP only. Never forward a
-            // credential or relay its challenge across an untrusted cleartext hop.
+        } else if !secure_listener {
+            // Never forward caller credentials over a cleartext client connection.
             error_response(StatusCode::FORBIDDEN, "forbidden\n")
+        } else {
+            return next.run(request).await;
         };
         return bodyless_for_head(&method, response);
     }
     next.run(request).await
+}
+
+type PendingTlsHandshake = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Result<TlsStream<TcpStream>, io::Error>,
+                    std::net::SocketAddr,
+                ),
+            > + Send,
+    >,
+>;
+
+struct HttpsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    handshakes: FuturesUnordered<PendingTlsHandshake>,
+}
+
+impl HttpsListener {
+    fn new(listener: TcpListener, acceptor: TlsAcceptor) -> Self {
+        Self {
+            listener,
+            acceptor,
+            handshakes: FuturesUnordered::new(),
+        }
+    }
+}
+
+impl Listener for HttpsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let can_accept = self.handshakes.len() < MAX_PENDING_TLS_HANDSHAKES;
+            tokio::select! {
+                result = self.handshakes.next(), if !self.handshakes.is_empty() => {
+                    match result {
+                        Some((Ok(stream), address)) => return (stream, address),
+                        Some((Err(_), _)) => debug!("HTTPS client handshake rejected"),
+                        None => {}
+                    }
+                }
+                result = self.listener.accept(), if can_accept => {
+                    match result {
+                        Ok((stream, address)) => {
+                            let acceptor = self.acceptor.clone();
+                            self.handshakes.push(Box::pin(async move {
+                                let handshake = tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(stream),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::TimedOut,
+                                        "TLS handshake timed out",
+                                    ))
+                                });
+                                (handshake, address)
+                            }));
+                        }
+                        Err(error) if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::ConnectionReset
+                        ) => {}
+                        Err(error) => {
+                            warn!(%error, "HTTPS listener accept failed");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+fn load_tls_acceptor(certificate_path: &Path, key_path: &Path) -> Result<TlsAcceptor, AppError> {
+    let certificate_pem = read_tls_material(certificate_path)?;
+    let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AppError::InvalidTlsMaterial)?
+        .into_iter()
+        .map(CertificateDer::into_owned)
+        .collect::<Vec<_>>();
+    if certificates.is_empty() {
+        return Err(AppError::InvalidTlsMaterial);
+    }
+
+    let key_pem = read_tls_material(key_path)?;
+    let private_key =
+        PrivateKeyDer::from_pem_slice(&key_pem).map_err(|_| AppError::InvalidTlsMaterial)?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| AppError::InvalidTlsMaterial)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn read_tls_material(path: &Path) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    let file = File::open(path).map_err(AppError::TlsMaterial)?;
+    let mut limited = file.take(MAX_TLS_MATERIAL_BYTES + 1);
+    let mut material = Zeroizing::new(Vec::new());
+    limited
+        .read_to_end(&mut material)
+        .map_err(AppError::TlsMaterial)?;
+    if material.len() as u64 > MAX_TLS_MATERIAL_BYTES {
+        return Err(AppError::InvalidTlsMaterial);
+    }
+    Ok(material)
 }
 
 async fn health() -> StatusCode {
@@ -130,13 +290,14 @@ async fn route_request_inner(
         return method_not_allowed();
     }
 
+    let authorization = headers.get(header::AUTHORIZATION).cloned();
     let resolved = match state.config.resolve_served_path(uri.path()) {
         Ok(Some(resolved)) => resolved,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "not found\n"),
         Err(TreeError::InvalidPath) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid path\n");
         }
-        Err(error) => return tree_error_response(error),
+        Err(error) => return tree_error_response(error, state.secure_listener),
     };
     let mount_index = state
         .config
@@ -158,38 +319,73 @@ async fn route_request_inner(
                 &resolved.storage_path,
                 file::AUTO_INDEX_PAGE_SIZE,
                 None,
-                None,
+                authorization.as_ref(),
             )
             .await
         {
-            Ok(page) => file::directory_response(store.clone(), &resolved, page, method),
-            Err(error) => tree_error_response(error),
+            Ok(page) => match file::directory_response(
+                store.clone(),
+                &resolved,
+                page,
+                method,
+                authorization,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(file::DirectoryResponseError::Tree(error)) => {
+                    tree_error_response(error, state.secure_listener)
+                }
+                Err(file::DirectoryResponseError::TemporaryStorage) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+                }
+            },
+            Err(error) => tree_error_response(error, state.secure_listener),
         };
     }
 
     if method == Method::HEAD {
-        return match store.stat_file(&resolved.storage_path, None).await {
+        return match store
+            .stat_file(&resolved.storage_path, authorization.as_ref())
+            .await
+        {
             Ok(descriptor) => file::head_response(&descriptor, &resolved.storage_path, &headers),
             Err(TreeError::IsDirectory) => {
-                match store.list_page(&resolved.storage_path, 1, None, None).await {
+                match store
+                    .list_page(&resolved.storage_path, 1, None, authorization.as_ref())
+                    .await
+                {
                     Ok(_) => permanent_redirect(&resolved),
-                    Err(error) => tree_error_response(error),
+                    Err(error) => tree_error_response(error, state.secure_listener),
                 }
             }
-            Err(error) => tree_error_response(error),
+            Err(error) => tree_error_response(error, state.secure_listener),
         };
     }
 
-    let file_result = store.read_file(&resolved.storage_path, None).await;
+    let file_result = store
+        .read_file(&resolved.storage_path, authorization.as_ref())
+        .await;
     match file_result {
-        Ok(file) => file::get_response(file, &resolved.storage_path, &headers).await,
+        Ok(file) => {
+            file::get_response(
+                file,
+                &resolved.storage_path,
+                &headers,
+                state.secure_listener,
+            )
+            .await
+        }
         Err(TreeError::IsDirectory) => {
-            match store.list_page(&resolved.storage_path, 1, None, None).await {
+            match store
+                .list_page(&resolved.storage_path, 1, None, authorization.as_ref())
+                .await
+            {
                 Ok(_) => permanent_redirect(&resolved),
-                Err(error) => tree_error_response(error),
+                Err(error) => tree_error_response(error, state.secure_listener),
             }
         }
-        Err(error) => tree_error_response(error),
+        Err(error) => tree_error_response(error, state.secure_listener),
     }
 }
 
@@ -221,7 +417,25 @@ fn permanent_redirect(path: &ResolvedPath<'_>) -> Response {
         .expect("canonical location is a valid header")
 }
 
-fn tree_error_response(error: TreeError) -> Response {
+fn tree_error_response(error: TreeError, secure_client: bool) -> Response {
+    let auth_status = match &error {
+        TreeError::Registry(error) if error.kind == ErrorKind::Unauthorized => {
+            Some(if !error.challenge_relay_allowed {
+                StatusCode::BAD_GATEWAY
+            } else if !secure_client {
+                StatusCode::FORBIDDEN
+            } else if auth::valid_challenges(&error.challenges) {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_GATEWAY
+            })
+        }
+        _ => None,
+    };
+    let challenges = (auth_status == Some(StatusCode::UNAUTHORIZED)).then(|| match &error {
+        TreeError::Registry(error) => error.challenges.clone(),
+        _ => unreachable!(),
+    });
     let retry_after = match &error {
         TreeError::Registry(error)
             if error.kind == ErrorKind::RateLimited
@@ -231,33 +445,49 @@ fn tree_error_response(error: TreeError) -> Response {
         }
         _ => None,
     };
-    let (status, message) = match &error {
-        TreeError::InvalidPath => (StatusCode::BAD_REQUEST, "invalid path\n"),
-        TreeError::NotFound => (StatusCode::NOT_FOUND, "not found\n"),
-        TreeError::MissingRoot => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n"),
-        TreeError::IsDirectory | TreeError::NotDirectory | TreeError::NotFile => {
-            (StatusCode::NOT_FOUND, "not found\n")
-        }
-        TreeError::Registry(error) => match error.kind {
-            ErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "gateway timeout\n"),
-            ErrorKind::RateLimited | ErrorKind::Transport | ErrorKind::Server => {
-                (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+    let (status, message) = match auth_status {
+        Some(StatusCode::UNAUTHORIZED) => (StatusCode::UNAUTHORIZED, "unauthorized\n"),
+        Some(StatusCode::FORBIDDEN) => (StatusCode::FORBIDDEN, "forbidden\n"),
+        Some(_) => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
+        None => match &error {
+            TreeError::InvalidPath => (StatusCode::BAD_REQUEST, "invalid path\n"),
+            TreeError::NotFound => (StatusCode::NOT_FOUND, "not found\n"),
+            TreeError::MissingRoot => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n"),
+            TreeError::IsDirectory | TreeError::NotDirectory | TreeError::NotFile => {
+                (StatusCode::NOT_FOUND, "not found\n")
             }
-            ErrorKind::Forbidden => (StatusCode::FORBIDDEN, "forbidden\n"),
-            ErrorKind::Unauthorized => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
+            TreeError::Registry(error) => match error.kind {
+                ErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "gateway timeout\n"),
+                ErrorKind::RateLimited | ErrorKind::Transport | ErrorKind::Server => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+                }
+                ErrorKind::Forbidden => (StatusCode::FORBIDDEN, "forbidden\n"),
+                ErrorKind::Unauthorized => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
+                _ => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
+            },
+            TreeError::InvalidMountTarget => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
             _ => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
         },
-        TreeError::InvalidMountTarget => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
-        _ => (StatusCode::BAD_GATEWAY, "bad gateway\n"),
     };
-    warn!(%status, %error, "OCI-backed request failed");
-    let mut response = error_response(status, message);
+    let mut response = logged_error_response(&error, status, message);
     if let Some(retry_after) = retry_after {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, retry_after);
     }
+    if let Some(challenges) = challenges {
+        for challenge in challenges {
+            response
+                .headers_mut()
+                .append(header::WWW_AUTHENTICATE, challenge);
+        }
+    }
     response
+}
+
+fn logged_error_response(error: &TreeError, status: StatusCode, message: &'static str) -> Response {
+    warn!(%status, %error, "OCI-backed request failed");
+    error_response(status, message)
 }
 
 fn valid_retry_after(value: &axum::http::HeaderValue) -> bool {
@@ -346,22 +576,83 @@ mod tests {
         })
     }
 
+    fn unauthorized_error(challenges: &[&'static str], relay_allowed: bool) -> TreeError {
+        TreeError::Registry(RegistryError {
+            kind: ErrorKind::Unauthorized,
+            status: Some(StatusCode::UNAUTHORIZED),
+            challenges: challenges
+                .iter()
+                .map(|value| HeaderValue::from_static(value))
+                .collect(),
+            retry_after: None,
+            challenge_relay_allowed: relay_allowed,
+        })
+    }
+
     #[test]
     fn relays_only_valid_retry_after_values_on_rate_limit_responses() {
         for value in ["120", "Wed, 21 Oct 2015 07:28:00 GMT"] {
-            let response = tree_error_response(rate_limit_error(Some(value)));
+            let response = tree_error_response(rate_limit_error(Some(value)), true);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(response.headers()[header::RETRY_AFTER], value);
         }
 
         for value in ["", "soon", "-1", "1.5"] {
-            let response = tree_error_response(rate_limit_error(Some(value)));
+            let response = tree_error_response(rate_limit_error(Some(value)), true);
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert!(!response.headers().contains_key(header::RETRY_AFTER));
         }
 
-        let response = tree_error_response(rate_limit_error(None));
+        let response = tree_error_response(rate_limit_error(None), true);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
+    fn relays_only_valid_registry_challenges_to_secure_clients() {
+        let challenges = [
+            r#"Basic realm="registry""#,
+            r#"Bearer realm="https://auth.example/token",service="registry""#,
+        ];
+        let response = tree_error_response(unauthorized_error(&challenges, true), true);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let received = response
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(received, challenges);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(response.headers()[header::VARY], "Authorization");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "13");
+    }
+
+    #[test]
+    fn suppresses_invalid_or_untrusted_challenges_and_cleartext_challenges() {
+        for (error, secure_client, expected_status) in [
+            (
+                unauthorized_error(&[r#"Bearer realm="http://auth.example/token""#], true),
+                true,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                unauthorized_error(&[r#"Bearer realm="https://auth.example/token""#], false),
+                true,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                unauthorized_error(&[r#"Bearer realm="https://auth.example/token""#], true),
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = tree_error_response(error, secure_client);
+            assert_eq!(response.status(), expected_status);
+            assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
     }
 }

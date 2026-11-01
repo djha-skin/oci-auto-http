@@ -1,8 +1,11 @@
-use std::{collections::VecDeque, io};
+use std::{
+    collections::VecDeque,
+    io::{self, SeekFrom},
+};
 
 use axum::{
     body::Body,
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::Response,
 };
 use bytes::Bytes;
@@ -12,6 +15,7 @@ use oci_auto_http::{
     registry::{Descriptor, Digest},
     tree::{DirectoryEntry, DirectoryPage, EntryKind, StoragePath, TreeError, TreeFile, TreeStore},
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
 use super::{error_response, tree_error_response};
@@ -60,6 +64,7 @@ pub(super) async fn get_response(
     file: TreeFile,
     path: &StoragePath,
     headers: &HeaderMap,
+    secure_client: bool,
 ) -> Response {
     let size = file.descriptor.size;
     let etag = etag_value(&file.descriptor.digest);
@@ -84,7 +89,7 @@ pub(super) async fn get_response(
                 None,
                 Body::empty(),
             ),
-            Err(error) => tree_error_response(error),
+            Err(error) => tree_error_response(error, secure_client),
         },
         RangeSelection::Full => file_response(
             StatusCode::OK,
@@ -149,12 +154,24 @@ pub(super) fn accepts_html(headers: &HeaderMap) -> bool {
     exact_html.or(text_wildcard).or(any_wildcard).unwrap_or(0.0) > 0.0
 }
 
-pub(super) fn directory_response(
+pub(super) enum DirectoryResponseError {
+    Tree(TreeError),
+    TemporaryStorage,
+}
+
+impl From<TreeError> for DirectoryResponseError {
+    fn from(error: TreeError) -> Self {
+        Self::Tree(error)
+    }
+}
+
+pub(super) async fn directory_response(
     store: TreeStore,
     path: &ResolvedPath<'_>,
     first_page: DirectoryPage,
     method: Method,
-) -> Response {
+    authorization: Option<HeaderValue>,
+) -> Result<Response, DirectoryResponseError> {
     let body = if method == Method::HEAD {
         Body::from_stream(stream::empty::<Result<Bytes, io::Error>>())
     } else {
@@ -177,10 +194,11 @@ pub(super) fn directory_response(
             phase_finished,
             prefix: Some(autoindex_prefix(path)),
             footer_pending: true,
+            authorization,
         };
-        Body::from_stream(autoindex_stream(state))
+        Body::from_stream(spool_autoindex(state).await?)
     };
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
@@ -192,7 +210,39 @@ pub(super) fn directory_response(
         )
         .header(header::REFERRER_POLICY, "no-referrer")
         .body(body)
-        .expect("static autoindex response headers are valid")
+        .expect("static autoindex response headers are valid"))
+}
+
+async fn spool_autoindex(
+    state: AutoIndexStreamState,
+) -> Result<impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static, DirectoryResponseError> {
+    let file = tempfile::tempfile().map_err(|_| DirectoryResponseError::TemporaryStorage)?;
+    let mut file = tokio::fs::File::from_std(file);
+    let chunks = autoindex_stream(state);
+    futures_util::pin_mut!(chunks);
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| DirectoryResponseError::TemporaryStorage)?;
+    }
+    file.flush()
+        .await
+        .map_err(|_| DirectoryResponseError::TemporaryStorage)?;
+    file.seek(SeekFrom::Start(0))
+        .await
+        .map_err(|_| DirectoryResponseError::TemporaryStorage)?;
+
+    Ok(stream::try_unfold(file, |mut file| async move {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let count = file.read(&mut buffer).await?;
+        if count == 0 {
+            Ok(None)
+        } else {
+            buffer.truncate(count);
+            Ok(Some((Bytes::from(buffer), file)))
+        }
+    }))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,6 +263,7 @@ struct AutoIndexStreamState {
     phase_finished: bool,
     prefix: Option<Bytes>,
     footer_pending: bool,
+    authorization: Option<HeaderValue>,
 }
 
 fn autoindex_prefix(path: &ResolvedPath<'_>) -> Bytes {
@@ -280,7 +331,7 @@ fn escape_html(value: &str) -> String {
 
 fn autoindex_stream(
     state: AutoIndexStreamState,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+) -> impl Stream<Item = Result<Bytes, TreeError>> + Send + 'static {
     stream::unfold(state, |mut state| async move {
         if let Some(prefix) = state.prefix.take() {
             return Some((Ok(prefix), state));
@@ -289,14 +340,11 @@ fn autoindex_stream(
             if let Some(entry) = state.pending.pop_front() {
                 return match render_directory_entry(&state.mount, &state.directory, entry) {
                     Ok(chunk) => Some((Ok(chunk), state)),
-                    Err(_) => {
+                    Err(error) => {
                         state.phase = AutoIndexPhase::Done;
                         state.pending.clear();
                         state.footer_pending = false;
-                        Some((
-                            Err(io::Error::other("directory metadata failed validation")),
-                            state,
-                        ))
+                        Some((Err(error), state))
                     }
                 };
             }
@@ -337,7 +385,7 @@ fn autoindex_stream(
                     AUTO_INDEX_PAGE_SIZE,
                     &state.root_digest,
                     state.cursor.as_deref(),
-                    None,
+                    state.authorization.as_ref(),
                 )
                 .await;
             let page = match page {
@@ -346,19 +394,14 @@ fn autoindex_stream(
                     state.phase = AutoIndexPhase::Done;
                     state.pending.clear();
                     state.footer_pending = false;
-                    return Some((
-                        Err(io::Error::other(
-                            "directory snapshot changed during listing",
-                        )),
-                        state,
-                    ));
+                    return Some((Err(TreeError::StaleCursor), state));
                 }
-                Err(_) => {
-                    warn!("OCI directory listing failed after response headers");
+                Err(error) => {
                     state.phase = AutoIndexPhase::Done;
                     state.pending.clear();
                     state.footer_pending = false;
-                    return Some((Err(io::Error::other("OCI directory listing failed")), state));
+                    warn!(%error, "OCI directory listing failed before response headers");
+                    return Some((Err(error), state));
                 }
             };
             let wanted_kind = match state.phase {

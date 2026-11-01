@@ -121,6 +121,15 @@ fn help_exposes_stable_command_groups_and_crud_verbs() {
         );
     }
 
+    let serve_help = Command::new(binary())
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(serve_help.status.success());
+    let serve_help = String::from_utf8(serve_help.stdout).unwrap();
+    assert!(serve_help.contains("--tls-cert"));
+    assert!(serve_help.contains("--tls-key"));
+
     for (group, verbs) in [
         (
             "artifact",
@@ -172,6 +181,37 @@ fn invalid_arguments_and_mount_usage_fail_actionably() {
         .unwrap();
     assert_eq!(missing_config.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&missing_config.stderr).contains("--config"));
+
+    for (arguments, required) in [
+        (
+            [
+                "serve",
+                "--config",
+                "config.example.toml",
+                "--tls-cert",
+                "cert.pem",
+            ],
+            "--tls-key",
+        ),
+        (
+            [
+                "serve",
+                "--config",
+                "config.example.toml",
+                "--tls-key",
+                "key.pem",
+            ],
+            "--tls-cert",
+        ),
+    ] {
+        let output = Command::new(binary()).args(arguments).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(required),
+            "missing TLS pair member {required}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let create_help = Command::new(binary())
         .args(["artifact", "create", "--help"])
@@ -651,6 +691,31 @@ fn valid_multiple_mounts_load_without_local_content_state() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(entries, [std::ffi::OsString::from("config.toml")]);
+}
+
+#[test]
+fn invalid_tls_material_fails_before_binding_the_listener() {
+    let temp = TempDir::new();
+    let certificate = temp.path.join("bad-cert.pem");
+    let key = temp.path.join("bad-key.pem");
+    fs::write(&certificate, "not a certificate").unwrap();
+    fs::write(&key, "not a private key").unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    let output = Command::new(binary())
+        .args(["serve", "--config"])
+        .arg(config_file())
+        .args(["--listen", &address.to_string(), "--tls-cert"])
+        .arg(&certificate)
+        .arg("--tls-key")
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid HTTPS listener certificate or private key"));
+    assert!(!stderr.contains("could not bind HTTP listener"));
+    assert!(!stderr.contains("not a private key"));
 }
 
 #[test]

@@ -43,6 +43,10 @@ pub enum AppError {
     ArtifactOutput(#[source] io::Error),
     #[error("could not read private registry CA certificate: {0}")]
     Certificate(#[source] io::Error),
+    #[error("could not read HTTPS listener certificate or key: {0}")]
+    TlsMaterial(#[source] io::Error),
+    #[error("invalid HTTPS listener certificate or private key")]
+    InvalidTlsMaterial,
     #[error("could not serialize artifact listing: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("could not prepare artifact input: {0}")]
@@ -72,7 +76,11 @@ impl AppError {
             Self::MountConfigIo(_) => 74,
             Self::Tree(error) => tree_exit_code(error),
             Self::Registry(error) => registry_exit_code(error),
-            Self::ArtifactInput(_) | Self::ArtifactOutput(_) | Self::Certificate(_) => 74,
+            Self::InvalidTlsMaterial => 2,
+            Self::ArtifactInput(_)
+            | Self::ArtifactOutput(_)
+            | Self::Certificate(_)
+            | Self::TlsMaterial(_) => 74,
             Self::Serialize(_) | Self::InputTask(_) => 70,
             Self::InteractiveInput => 2,
             Self::BindListener { .. } | Self::Serve(_) | Self::Logging(_) => 1,

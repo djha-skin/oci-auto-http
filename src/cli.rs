@@ -43,6 +43,12 @@ pub struct ServeArgs {
     /// Additional PEM CA certificate for the configured registries.
     #[arg(long, value_name = "FILE")]
     pub ca_cert: Option<PathBuf>,
+    /// PEM certificate chain for an HTTPS listener (required with --tls-key).
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for an HTTPS listener (required with --tls-cert).
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
     /// Override the listen address configured in the file.
     #[arg(long)]
     pub listen: Option<SocketAddr>,
