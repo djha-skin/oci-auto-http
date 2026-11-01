@@ -70,11 +70,7 @@ pub async fn run(args: ArtifactArgs) -> Result<(), AppError> {
             let file = store.read_file(&storage_path, None).await?;
             write_download(file.body, &output).await
         }
-        ArtifactCommand::List {
-            path,
-            limit,
-            cursor,
-        } => {
+        ArtifactCommand::List { path, limit } => {
             let (store, storage_path) = if let Some(path) = path.as_deref() {
                 store_for_path(&config, &policy, path, true)?
             } else {
@@ -86,15 +82,7 @@ pub async fn run(args: ArtifactArgs) -> Result<(), AppError> {
                     StoragePath::root(),
                 )
             };
-            let page = store
-                .list_page(&storage_path, limit, cursor.as_deref(), None)
-                .await?;
-            let entries = page.entries.iter().map(ListingEntry::from).collect();
-            write_json(&ListingOutput {
-                root_digest: page.root_digest.to_string(),
-                entries,
-                next_cursor: page.next_cursor,
-            })
+            write_listing(&store, &storage_path, limit).await
         }
         ArtifactCommand::Update { path, input } => {
             let (store, storage_path) = store_for_path(&config, &policy, &path, false)?;
@@ -334,6 +322,34 @@ async fn write_download(
     Ok(())
 }
 
+async fn write_listing(
+    store: &TreeStore,
+    path: &StoragePath,
+    limit: usize,
+) -> Result<(), AppError> {
+    let mut cursor = None;
+    let mut header_written = false;
+    loop {
+        let page = store
+            .list_page(path, limit, cursor.as_deref(), None)
+            .await?;
+        if !header_written {
+            write_json_line(&ListingHeader {
+                record_type: "listing",
+                root_digest: page.root_digest.to_string(),
+            })?;
+            header_written = true;
+        }
+        for entry in &page.entries {
+            write_json_line(&ListingEntry::from(entry))?;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(()),
+        }
+    }
+}
+
 fn read_ca_certificate(path: &Path) -> Result<Vec<u8>, AppError> {
     let file = File::open(path).map_err(AppError::Certificate)?;
     let mut limited = file.take(MAX_CA_CERT_BYTES + 1);
@@ -350,6 +366,10 @@ fn read_ca_certificate(path: &Path) -> Result<Vec<u8>, AppError> {
 }
 
 fn write_json(value: &impl Serialize) -> Result<(), AppError> {
+    write_json_line(value)
+}
+
+fn write_json_line(value: &impl Serialize) -> Result<(), AppError> {
     let mut encoded = serde_json::to_vec(value)?;
     encoded.push(b'\n');
     io::stdout()
@@ -365,14 +385,16 @@ struct MutationOutput<'a> {
 }
 
 #[derive(Serialize)]
-struct ListingOutput {
+struct ListingHeader {
+    #[serde(rename = "type")]
+    record_type: &'static str,
     root_digest: String,
-    entries: Vec<ListingEntry>,
-    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ListingEntry {
+    #[serde(rename = "type")]
+    record_type: &'static str,
     name: String,
     kind: &'static str,
     digest: String,
@@ -382,6 +404,7 @@ struct ListingEntry {
 impl From<&DirectoryEntry> for ListingEntry {
     fn from(entry: &DirectoryEntry) -> Self {
         Self {
+            record_type: "entry",
             name: entry.name.clone(),
             kind: match entry.kind {
                 EntryKind::File => "file",

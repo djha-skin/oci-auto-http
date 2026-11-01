@@ -81,16 +81,13 @@ pub enum ArtifactCommand {
         #[arg(short, long, value_name = "FILE", default_value = "-")]
         output: PathBuf,
     },
-    /// List one page of a directory at a served path as JSON.
+    /// Stream a directory listing at a served path as newline-delimited JSON.
     List {
         /// Absolute served URL path. Omit only when the config has one mount.
         path: Option<String>,
-        /// Maximum number of entries in this page.
+        /// Maximum entries fetched per registry-backed page.
         #[arg(long, default_value_t = 1000)]
         limit: usize,
-        /// Continue a prior listing using its opaque cursor.
-        #[arg(long, value_name = "TOKEN")]
-        cursor: Option<String>,
     },
     /// Replace an existing file at a served path.
     Update {

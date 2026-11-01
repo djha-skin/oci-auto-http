@@ -1,10 +1,11 @@
 #![cfg(unix)]
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -430,6 +431,199 @@ async fn tree_storage_survives_client_reconstruction_and_matches_independent_reg
 }
 
 #[tokio::test]
+async fn artifact_cli_crud_streams_and_persists_against_a_real_registry() {
+    let registry = TestRegistry::new(false);
+    let scratch = TempDir::new();
+    let config = scratch.path.join("artifact-cli.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[[mounts]]
+name = "packages"
+prefix = "/packages"
+registry = "{}"
+repository = "team/releases"
+"#,
+            registry.base_url
+        ),
+    )
+    .unwrap();
+
+    let file_bytes = b"file input\0 opaque=\xff";
+    let file_input = scratch.path.join("file-input.bin");
+    fs::write(&file_input, file_bytes).unwrap();
+    let file_path = "/packages/nested/dir/from-file.bin";
+    let created = artifact_cli(&registry, &config)
+        .args(["create", file_path, "--input"])
+        .arg(&file_input)
+        .output()
+        .unwrap();
+    let created = assert_cli_success(created);
+    let create_result: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(create_result["path"], file_path);
+    assert!(
+        create_result["root_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    let stdin_bytes = b"stdin input\0 opaque=\xfe";
+    let stdin_path = "/packages/nested/dir/from-stdin.bin";
+    let mut child = artifact_cli(&registry, &config)
+        .args(["create", stdin_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
+    let created_from_stdin = assert_cli_success(child.wait_with_output().unwrap());
+    let stdin_result: serde_json::Value =
+        serde_json::from_slice(&created_from_stdin.stdout).unwrap();
+    assert_eq!(stdin_result["path"], stdin_path);
+
+    let listing = artifact_cli(&registry, &config)
+        .args(["list", "/packages/nested/dir", "--limit", "1"])
+        .output()
+        .unwrap();
+    let listing = assert_cli_success(listing);
+    let records: Vec<serde_json::Value> = listing
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["type"], "listing");
+    let listing_root = records[0]["root_digest"].as_str().unwrap();
+    assert!(listing_root.starts_with("sha256:"));
+    let entries: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "entry")
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["name"], "from-file.bin");
+    assert_eq!(entries[1]["name"], "from-stdin.bin");
+
+    let read_stdout = artifact_cli(&registry, &config)
+        .args(["read", file_path])
+        .output()
+        .unwrap();
+    let read_stdout = assert_cli_success(read_stdout);
+    assert_eq!(read_stdout.stdout, file_bytes);
+
+    let download = scratch.path.join("downloaded.bin");
+    let read_file = artifact_cli(&registry, &config)
+        .args(["read", stdin_path, "--output"])
+        .arg(&download)
+        .output()
+        .unwrap();
+    assert_cli_success(read_file);
+    assert_eq!(fs::read(&download).unwrap(), stdin_bytes);
+
+    let replacement_bytes = b"replacement from a regular file\0\xff";
+    let replacement = scratch.path.join("replacement.bin");
+    fs::write(&replacement, replacement_bytes).unwrap();
+    let update = artifact_cli(&registry, &config)
+        .args(["update", file_path, "--input"])
+        .arg(&replacement)
+        .output()
+        .unwrap();
+    assert_cli_success(update);
+    assert_eq!(
+        curl_tree_file(&registry, &["nested", "dir", "from-file.bin"]),
+        replacement_bytes
+    );
+
+    let missing_update = artifact_cli(&registry, &config)
+        .args(["update", "/packages/missing.bin", "--input"])
+        .arg(&replacement)
+        .output()
+        .unwrap();
+    assert_eq!(missing_update.status.code(), Some(66));
+
+    let root_before_conflict = parse_listing(
+        artifact_cli(&registry, &config)
+            .args(["list", "/packages/nested/dir"])
+            .output()
+            .unwrap(),
+    )[0]["root_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let conflict = artifact_cli(&registry, &config)
+        .args(["create", file_path, "--input"])
+        .arg(&file_input)
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(73));
+    let root_after_conflict = parse_listing(
+        artifact_cli(&registry, &config)
+            .args(["list", "/packages/nested/dir"])
+            .output()
+            .unwrap(),
+    )[0]["root_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(root_after_conflict, root_before_conflict);
+
+    let empty_directory = "/packages/nested/empty";
+    let mkdir = artifact_cli(&registry, &config)
+        .args(["create", empty_directory, "--directory"])
+        .output()
+        .unwrap();
+    assert_cli_success(mkdir);
+    let empty_listing = artifact_cli(&registry, &config)
+        .args(["list", empty_directory])
+        .output()
+        .unwrap();
+    let empty_listing = parse_listing(empty_listing);
+    assert_eq!(
+        empty_listing.len(),
+        1,
+        "empty listing emits just its header"
+    );
+    assert_eq!(empty_listing[0]["type"], "listing");
+
+    let delete_file = artifact_cli(&registry, &config)
+        .args(["delete", stdin_path])
+        .output()
+        .unwrap();
+    assert_cli_success(delete_file);
+    let deleted_read = artifact_cli(&registry, &config)
+        .args(["read", stdin_path])
+        .output()
+        .unwrap();
+    assert_eq!(deleted_read.status.code(), Some(66));
+
+    let nonrecursive = artifact_cli(&registry, &config)
+        .args(["delete", "/packages/nested/dir"])
+        .output()
+        .unwrap();
+    assert_eq!(nonrecursive.status.code(), Some(73));
+    let delete_directory = artifact_cli(&registry, &config)
+        .args(["delete", "/packages/nested", "--recursive"])
+        .output()
+        .unwrap();
+    assert_cli_success(delete_directory);
+    let deleted_directory = artifact_cli(&registry, &config)
+        .args(["list", "/packages/nested"])
+        .output()
+        .unwrap();
+    assert_eq!(deleted_directory.status.code(), Some(66));
+
+    let root_bytes = registry.curl_api(
+        &format!("manifests/{}", registry.mount.root_tag),
+        Some(OCI_IMAGE_INDEX),
+    );
+    let root: serde_json::Value = serde_json::from_slice(&root_bytes).unwrap();
+    assert_eq!(root["mediaType"], OCI_IMAGE_INDEX);
+}
+
+#[tokio::test]
 async fn tree_concurrent_writers_and_pinned_listing_cursor_preserve_snapshots() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -672,6 +866,79 @@ fn descriptor_named<'a>(
         .iter()
         .find(|descriptor| descriptor["annotations"][annotation] == name)
         .unwrap_or_else(|| panic!("descriptor {name:?} not found in OCI index"))
+}
+
+fn cli_binary() -> PathBuf {
+    ["CARGO_BIN_EXE_oci-auto-http", "CARGO_BIN_EXE_oci_auto_http"]
+        .into_iter()
+        .find_map(std::env::var_os)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let suffix = std::env::consts::EXE_SUFFIX;
+            std::env::current_exe()
+                .expect("test executable path is available")
+                .parent()
+                .and_then(Path::parent)
+                .expect("test executable is under target/<profile>/deps")
+                .join(format!("oci-auto-http{suffix}"))
+        })
+}
+
+fn artifact_cli(registry: &TestRegistry, config: &Path) -> Command {
+    let mut command = Command::new(cli_binary());
+    command
+        .args(["artifact", "--config"])
+        .arg(config)
+        .args(["--ca-cert"])
+        .arg(&registry.certificate);
+    command
+}
+
+fn assert_cli_success(output: Output) -> Output {
+    assert!(
+        output.status.success(),
+        "CLI command failed: status={:?}, stdout={:?}, stderr={}",
+        output.status.code(),
+        output.stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn parse_listing(output: Output) -> Vec<serde_json::Value> {
+    assert_cli_success(output)
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+fn curl_tree_file(registry: &TestRegistry, path: &[&str]) -> Vec<u8> {
+    const ENTRY_NAME: &str = "io.github.djha-skin.oci-auto-http.entry-name";
+    let root_bytes = registry.curl_api(
+        &format!("manifests/{}", registry.mount.root_tag),
+        Some(OCI_IMAGE_INDEX),
+    );
+    let mut index: serde_json::Value = serde_json::from_slice(&root_bytes).unwrap();
+    for component in &path[..path.len() - 1] {
+        let descriptor = descriptor_named(&index, component, ENTRY_NAME);
+        assert_eq!(descriptor["mediaType"], OCI_IMAGE_INDEX);
+        let bytes = registry.curl_api(
+            &format!("manifests/{}", descriptor["digest"].as_str().unwrap()),
+            Some(OCI_IMAGE_INDEX),
+        );
+        index = serde_json::from_slice(&bytes).unwrap();
+    }
+    let descriptor = descriptor_named(&index, path[path.len() - 1], ENTRY_NAME);
+    assert_eq!(descriptor["mediaType"], OCI_IMAGE_MANIFEST);
+    let bytes = registry.curl_api(
+        &format!("manifests/{}", descriptor["digest"].as_str().unwrap()),
+        Some(OCI_IMAGE_MANIFEST),
+    );
+    let file_manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let layer_digest = file_manifest["layers"][0]["digest"].as_str().unwrap();
+    registry.curl_api(&format!("blobs/{layer_digest}"), None)
 }
 
 struct TestRegistry {
