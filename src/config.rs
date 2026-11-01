@@ -244,9 +244,16 @@ fn valid_mount_name(name: &str) -> bool {
 }
 
 fn validate_registry(value: &str) -> Option<Url> {
-    if value.contains('@') {
+    let (scheme, remainder) = value.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") || value.contains('@') || value.contains('\\') {
         return None;
     }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let path_and_suffix = &remainder[authority_end..];
+    if !path_and_suffix.is_empty() && path_and_suffix != "/" {
+        return None;
+    }
+
     let url = Url::parse(value).ok()?;
     if url.scheme() != "https"
         || url.host_str().is_none()

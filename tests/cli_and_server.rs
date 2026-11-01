@@ -213,6 +213,13 @@ fn malformed_ambiguous_and_unsafe_configs_fail_before_listening() {
             base.replace("https://reg-b.example:5443", "http://reg-b.example:5443"),
         ),
         (
+            "normalized dot-segment registry path",
+            base.replace(
+                "https://reg-b.example:5443",
+                "https://reg-b.example:5443/a/..",
+            ),
+        ),
+        (
             "registry userinfo",
             base.replace(
                 "https://reg-b.example:5443",
