@@ -2056,7 +2056,52 @@ async fn serve_enforces_idle_timeout_after_stream_headers_are_sent() {
 }
 
 #[tokio::test]
-async fn serve_rejects_empty_userinfo_blob_redirects_before_contacting_the_allowlist() {
+async fn registry_rejects_unsafe_upload_locations_before_contacting_the_allowlist() {
+    let registry = TestRegistry::new(false);
+    let trap = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    trap.set_nonblocking(true).unwrap();
+    let trap_address = trap.local_addr().unwrap();
+    let proxy = FaultProxy::redirecting_upload_location(
+        &registry,
+        format!("https:\t//@{trap_address}/uploads/session"),
+    )
+    .await;
+    let mut mount = registry.mount.clone();
+    mount.registry = Url::parse(&proxy.base_url).unwrap();
+    mount.redirect_allowlist = vec![trap_address.to_string()];
+    let ca = fs::read(&registry.certificate).unwrap();
+    let client = RegistryClient::new(
+        mount,
+        ClientPolicy::default().with_root_certificate_pem(&ca),
+    )
+    .unwrap();
+    let error = client
+        .put_blob(
+            Bytes::from_static(b"upload should not follow the session"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::RedirectDenied);
+    assert!(proxy.upload_location_fired());
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match trap.accept() {
+            Ok((_, peer)) => panic!("unsafe upload location contacted trap target: {peer}"),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not inspect upload trap listener: {error}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn serve_rejects_unsafe_blob_redirect_references_before_contacting_the_allowlist() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
     tree.write_file(
@@ -2076,53 +2121,59 @@ async fn serve_rejects_empty_userinfo_blob_redirects_before_contacting_the_allow
     let trap = StdTcpListener::bind("127.0.0.1:0").unwrap();
     trap.set_nonblocking(true).unwrap();
     let trap_address = trap.local_addr().unwrap();
-    let proxy = FaultProxy::redirecting_blob(
-        &registry,
-        &descriptor.digest,
-        format!("https://@{trap_address}/redirected"),
-    )
-    .await;
     let scratch = TempDir::new();
-    let config_path = scratch.path.join("userinfo-redirect.toml");
-    fs::write(
-        &config_path,
-        format!(
-            "version = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\nredirect_allowlist = [\"{}\"]\n",
-            proxy.base_url, trap_address
+    let config_path = scratch.path.join("unsafe-redirect.toml");
+    for (case, location) in [
+        (
+            "empty-userinfo",
+            format!("https://@{trap_address}/redirected"),
         ),
-    )
-    .unwrap();
-    let address = unused_http_address();
-    let mut server = spawn_http_server(&config_path, &registry.certificate, address);
-    wait_for_http_server(&mut server.child, address);
+        (
+            "tab-normalized-userinfo",
+            format!("https:\t//@{trap_address}/redirected"),
+        ),
+    ] {
+        let proxy = FaultProxy::redirecting_blob(&registry, &descriptor.digest, location).await;
+        fs::write(
+            &config_path,
+            format!(
+                "version = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\nredirect_allowlist = [\"{}\"]\n",
+                proxy.base_url, trap_address
+            ),
+        )
+        .unwrap();
+        let address = unused_http_address();
+        let mut server = spawn_http_server(&config_path, &registry.certificate, address);
+        wait_for_http_server(&mut server.child, address);
 
-    let response = tokio::task::spawn_blocking(move || {
-        http_request(address, "GET", "/files/redirect.bin", &[])
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(response.status, 502);
-    assert_eq!(response.body, b"bad gateway\n");
-    assert!(!response.headers.contains_key("location"));
-    assert!(!response.headers.contains_key("www-authenticate"));
-    assert!(proxy.blob_redirect_fired());
+        let response = tokio::task::spawn_blocking(move || {
+            http_request(address, "GET", "/files/redirect.bin", &[])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 502, "case {case}");
+        assert_eq!(response.body, b"bad gateway\n");
+        assert!(!response.headers.contains_key("location"));
+        assert!(!response.headers.contains_key("www-authenticate"));
+        assert!(proxy.blob_redirect_fired());
 
-    let deadline = Instant::now() + Duration::from_millis(250);
-    loop {
-        match trap.accept() {
-            Ok((_, peer)) => panic!("untrusted redirect target was contacted: {peer}"),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    break;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match trap.accept() {
+                Ok((_, peer)) => panic!("redirect case {case} contacted trap target: {peer}"),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
                 }
-                thread::sleep(Duration::from_millis(10));
+                Err(error) => panic!("could not inspect redirect trap listener: {error}"),
             }
-            Err(error) => panic!("could not inspect redirect trap listener: {error}"),
         }
+        let stderr = stop_http_server(&mut server);
+        assert!(!stderr.contains(&trap_address.to_string()));
     }
-    let stderr = stop_http_server(&mut server);
-    assert!(!stderr.contains(&trap_address.to_string()));
 }
 
 #[tokio::test]
@@ -3850,6 +3901,8 @@ struct FaultProxyOptions {
     tracked_blob_delay: Duration,
     blob_redirect_path: Option<String>,
     blob_redirect_location: Option<String>,
+    upload_location_path: Option<String>,
+    upload_location: Option<String>,
 }
 
 impl Default for FaultProxyOptions {
@@ -3867,6 +3920,8 @@ impl Default for FaultProxyOptions {
             tracked_blob_delay: Duration::from_millis(2),
             blob_redirect_path: None,
             blob_redirect_location: None,
+            upload_location_path: None,
+            upload_location: None,
         }
     }
 }
@@ -3898,6 +3953,9 @@ struct FaultState {
     blob_redirect_path: Option<String>,
     blob_redirect_location: Option<String>,
     blob_redirect_fired: AtomicBool,
+    upload_location_path: Option<String>,
+    upload_location: Option<String>,
+    upload_location_fired: AtomicBool,
 }
 
 struct FaultProxy {
@@ -4018,6 +4076,19 @@ impl FaultProxy {
         .await
     }
 
+    async fn redirecting_upload_location(registry: &TestRegistry, location: String) -> Self {
+        let path = format!("/v2/{}/blobs/uploads/", registry.mount.repository);
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                upload_location_path: Some(path),
+                upload_location: Some(location),
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
+    }
+
     async fn new_with_tracked_blob(registry: &TestRegistry, options: FaultProxyOptions) -> Self {
         let FaultProxyOptions {
             mode,
@@ -4032,6 +4103,8 @@ impl FaultProxy {
             tracked_blob_delay,
             blob_redirect_path,
             blob_redirect_location,
+            upload_location_path,
+            upload_location,
         } = options;
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
@@ -4110,6 +4183,9 @@ impl FaultProxy {
             blob_redirect_path,
             blob_redirect_location,
             blob_redirect_fired: AtomicBool::new(false),
+            upload_location_path,
+            upload_location,
+            upload_location_fired: AtomicBool::new(false),
         });
         let task = {
             let upstream = registry.base_url.clone();
@@ -4201,6 +4277,10 @@ impl FaultProxy {
         self.state.blob_redirect_fired.load(Ordering::SeqCst)
     }
 
+    fn upload_location_fired(&self) -> bool {
+        self.state.upload_location_fired.load(Ordering::SeqCst)
+    }
+
     fn registry_client(&self, registry: &TestRegistry) -> RegistryClient {
         let mut mount: Mount = registry.mount.clone();
         mount.registry = Url::parse(&self.base_url).unwrap();
@@ -4245,6 +4325,19 @@ async fn proxy_registry_request(
     if state.delayed_request_path.as_deref() == Some(parts.uri.path()) {
         state.delay_fired.store(true, Ordering::SeqCst);
         tokio::time::sleep(state.delayed_request).await;
+    }
+    if parts.method == reqwest::Method::POST
+        && state.upload_location_path.as_deref() == Some(parts.uri.path())
+    {
+        state.upload_location_fired.store(true, Ordering::SeqCst);
+        return Response::builder()
+            .status(reqwest::StatusCode::ACCEPTED)
+            .header(
+                reqwest::header::LOCATION,
+                state.upload_location.as_deref().unwrap(),
+            )
+            .body(AxumBody::empty())
+            .map_err(|error| io::Error::other(error.to_string()));
     }
     if parts.method == reqwest::Method::GET
         && state.blob_redirect_path.as_deref() == Some(parts.uri.path())
