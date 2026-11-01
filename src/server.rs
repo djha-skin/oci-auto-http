@@ -636,6 +636,11 @@ mod tests {
     fn suppresses_invalid_or_untrusted_challenges_and_cleartext_challenges() {
         for (error, secure_client, expected_status) in [
             (
+                unauthorized_error(&[r#"Bearer realm="https://@auth.example/token""#], true),
+                true,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
                 unauthorized_error(&[r#"Bearer realm="https://auth.example/token%""#], true),
                 true,
                 StatusCode::BAD_GATEWAY,

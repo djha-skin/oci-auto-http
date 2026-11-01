@@ -1845,6 +1845,77 @@ repository = "team/releases"
     }
 }
 
+#[tokio::test]
+async fn serve_maps_a_late_autoindex_page_challenge_before_committing_success_headers() {
+    let registry = TestRegistry::new(false);
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    for index in 0..129 {
+        tree.write_file(
+            &StoragePath::parse_relative(&format!("items/entry-{index:03}.txt")).unwrap(),
+            Bytes::from_static(b"listing entry"),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    drop(tree);
+
+    let root = registry
+        .client(ClientPolicy::default())
+        .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+        .await
+        .unwrap();
+    let proxy = FaultProxy::challenge_after_manifest_gets(&registry, &root.digest, 5).await;
+    let scratch = TempDir::new();
+    let config_path = scratch.path.join("late-challenge.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "version = 1\n[[mounts]]\nname = \"files\"\nprefix = \"/files\"\nregistry = \"{}\"\nrepository = \"team/releases\"\n",
+            proxy.base_url
+        ),
+    )
+    .unwrap();
+
+    let certificates = registry.certificate.parent().unwrap();
+    let listener_certificate = certificates.join("localhost.crt");
+    let listener_key = certificates.join("localhost.key");
+    let client = https_test_client(&registry.certificate);
+    let address = unused_http_address();
+    let mut server = spawn_https_http_server(
+        &config_path,
+        &registry.certificate,
+        &listener_certificate,
+        &listener_key,
+        address,
+    );
+    wait_for_https_http_server(&mut server.child, address, &client).await;
+
+    let response = client
+        .get(format!("https://{address}/files/items/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let challenges: Vec<_> = response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        challenges,
+        ["Bearer realm=\"https://auth.example/token\",service=\"registry-test\""]
+    );
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"unauthorized\n");
+    assert!(proxy.auth_challenge_fired());
+    assert_eq!(proxy.auth_challenge_matches(), 5);
+
+    let stderr = stop_http_server(&mut server);
+    assert!(!stderr.contains("auth.example/token"));
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn serve_streams_large_files_with_bounded_rss_and_cancels_after_disconnect() {
@@ -2959,6 +3030,30 @@ enum CommitFault {
     AfterCommit,
 }
 
+struct FaultProxyOptions {
+    mode: CommitFault,
+    tracked_blob_path: Option<String>,
+    corrupt_tracked_blob: bool,
+    rate_limit_path: Option<String>,
+    rate_limit_after: Option<HeaderValue>,
+    auth_challenge_path: Option<String>,
+    auth_challenge_after: usize,
+}
+
+impl Default for FaultProxyOptions {
+    fn default() -> Self {
+        Self {
+            mode: CommitFault::BeforeCommit,
+            tracked_blob_path: None,
+            corrupt_tracked_blob: false,
+            rate_limit_path: None,
+            rate_limit_after: None,
+            auth_challenge_path: None,
+            auth_challenge_after: 0,
+        }
+    }
+}
+
 struct FaultState {
     mode: CommitFault,
     root_path: String,
@@ -2975,6 +3070,10 @@ struct FaultState {
     fault_fired: AtomicBool,
     root_put_attempts: AtomicUsize,
     root_put_forwarded: AtomicUsize,
+    auth_challenge_path: Option<String>,
+    auth_challenge_after: usize,
+    auth_challenge_matches: AtomicUsize,
+    auth_challenge_fired: AtomicBool,
 }
 
 struct FaultProxy {
@@ -2985,18 +3084,24 @@ struct FaultProxy {
 
 impl FaultProxy {
     async fn new(registry: &TestRegistry, mode: CommitFault) -> Self {
-        Self::new_with_tracked_blob(registry, mode, None, false, None, None).await
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                mode,
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
     }
 
     async fn tracking_blob(registry: &TestRegistry, digest: &Digest) -> Self {
         let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
         Self::new_with_tracked_blob(
             registry,
-            CommitFault::BeforeCommit,
-            Some(path),
-            false,
-            None,
-            None,
+            FaultProxyOptions {
+                tracked_blob_path: Some(path),
+                ..FaultProxyOptions::default()
+            },
         )
         .await
     }
@@ -3005,11 +3110,11 @@ impl FaultProxy {
         let path = format!("/v2/{}/blobs/{digest}", registry.mount.repository);
         Self::new_with_tracked_blob(
             registry,
-            CommitFault::BeforeCommit,
-            Some(path),
-            true,
-            None,
-            None,
+            FaultProxyOptions {
+                tracked_blob_path: Some(path),
+                corrupt_tracked_blob: true,
+                ..FaultProxyOptions::default()
+            },
         )
         .await
     }
@@ -3021,23 +3126,42 @@ impl FaultProxy {
         );
         Self::new_with_tracked_blob(
             registry,
-            CommitFault::BeforeCommit,
-            None,
-            false,
-            Some(path),
-            retry_after.map(HeaderValue::from_static),
+            FaultProxyOptions {
+                rate_limit_path: Some(path),
+                rate_limit_after: retry_after.map(HeaderValue::from_static),
+                ..FaultProxyOptions::default()
+            },
         )
         .await
     }
 
-    async fn new_with_tracked_blob(
+    async fn challenge_after_manifest_gets(
         registry: &TestRegistry,
-        mode: CommitFault,
-        tracked_blob_path: Option<String>,
-        corrupt_tracked_blob: bool,
-        rate_limit_path: Option<String>,
-        rate_limit_after: Option<HeaderValue>,
+        digest: &Digest,
+        after: usize,
     ) -> Self {
+        let path = format!("/v2/{}/manifests/{digest}", registry.mount.repository);
+        Self::new_with_tracked_blob(
+            registry,
+            FaultProxyOptions {
+                auth_challenge_path: Some(path),
+                auth_challenge_after: after,
+                ..FaultProxyOptions::default()
+            },
+        )
+        .await
+    }
+
+    async fn new_with_tracked_blob(registry: &TestRegistry, options: FaultProxyOptions) -> Self {
+        let FaultProxyOptions {
+            mode,
+            tracked_blob_path,
+            corrupt_tracked_blob,
+            rate_limit_path,
+            rate_limit_after,
+            auth_challenge_path,
+            auth_challenge_after,
+        } = options;
         let certificates = registry.certificate.parent().unwrap();
         let certificate_der = certificates.join("localhost.der");
         let key_der = certificates.join("localhost-key.der");
@@ -3104,6 +3228,10 @@ impl FaultProxy {
             fault_fired: AtomicBool::new(false),
             root_put_attempts: AtomicUsize::new(0),
             root_put_forwarded: AtomicUsize::new(0),
+            auth_challenge_path,
+            auth_challenge_after,
+            auth_challenge_matches: AtomicUsize::new(0),
+            auth_challenge_fired: AtomicBool::new(false),
         });
         let task = {
             let upstream = registry.base_url.clone();
@@ -3179,6 +3307,14 @@ impl FaultProxy {
         self.state.corruption_fired.load(Ordering::SeqCst)
     }
 
+    fn auth_challenge_matches(&self) -> usize {
+        self.state.auth_challenge_matches.load(Ordering::SeqCst)
+    }
+
+    fn auth_challenge_fired(&self) -> bool {
+        self.state.auth_challenge_fired.load(Ordering::SeqCst)
+    }
+
     fn registry_client(&self, registry: &TestRegistry) -> RegistryClient {
         let mut mount: Mount = registry.mount.clone();
         mount.registry = Url::parse(&self.base_url).unwrap();
@@ -3220,6 +3356,22 @@ async fn proxy_registry_request(
 
     let (parts, body) = request.into_parts();
     state.total_requests.fetch_add(1, Ordering::SeqCst);
+    if parts.method == reqwest::Method::GET
+        && state.auth_challenge_path.as_deref() == Some(parts.uri.path())
+    {
+        let matched = state.auth_challenge_matches.fetch_add(1, Ordering::SeqCst) + 1;
+        if matched == state.auth_challenge_after {
+            state.auth_challenge_fired.store(true, Ordering::SeqCst);
+            return Response::builder()
+                .status(reqwest::StatusCode::UNAUTHORIZED)
+                .header(
+                    reqwest::header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"https://auth.example/token\",service=\"registry-test\"",
+                )
+                .body(AxumBody::empty())
+                .map_err(|error| io::Error::other(error.to_string()));
+        }
+    }
     if parts.method == reqwest::Method::HEAD
         && state.rate_limit_path.as_deref() == Some(parts.uri.path())
     {

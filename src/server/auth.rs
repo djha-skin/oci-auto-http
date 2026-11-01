@@ -219,6 +219,7 @@ fn valid_bearer_realm(realm: &[u8]) -> bool {
             url.host_str().is_some()
                 && url.username().is_empty()
                 && url.password().is_none()
+                && !contains_raw_userinfo(realm)
                 && valid_url_syntax(realm.as_bytes())
         }
         Ok(_) => false,
@@ -233,6 +234,13 @@ fn valid_bearer_realm(realm: &[u8]) -> bool {
                 && !realm.contains("://")
         }
     }
+}
+
+fn contains_raw_userinfo(value: &str) -> bool {
+    value
+        .split_once("://")
+        .and_then(|(_, authority_and_path)| authority_and_path.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 fn valid_url_syntax(value: &[u8]) -> bool {
@@ -358,6 +366,7 @@ mod tests {
             "",
             "Bearer realm=\"http://auth.example/token\"",
             "Bearer realm=\"https://user:secret@auth.example/token\"",
+            "Bearer realm=\"https://@auth.example/token\"",
             "Bearer realm=\"ftp://auth.example/token\"",
             "Bearer realm=\"file:///etc/passwd\"",
             "Bearer realm=\"//auth.example/token\"",
