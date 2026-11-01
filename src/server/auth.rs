@@ -216,7 +216,10 @@ fn valid_bearer_realm(realm: &[u8]) -> bool {
     match Url::parse(realm) {
         Ok(url) if url.cannot_be_a_base() => true,
         Ok(url) if url.scheme() == "https" => {
-            url.host_str().is_some() && url.username().is_empty() && url.password().is_none()
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && valid_url_syntax(realm.as_bytes())
         }
         Ok(_) => false,
         Err(_) => {
@@ -230,6 +233,55 @@ fn valid_bearer_realm(realm: &[u8]) -> bool {
                 && !realm.contains("://")
         }
     }
+}
+
+fn valid_url_syntax(value: &[u8]) -> bool {
+    let mut position = 0;
+    while position < value.len() {
+        let byte = value[position];
+        if byte == b'%' {
+            if position + 2 >= value.len()
+                || !value[position + 1].is_ascii_hexdigit()
+                || !value[position + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            position += 3;
+        } else if is_uri_character(byte) {
+            position += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_uri_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+        )
 }
 
 fn is_ows(byte: u8) -> bool {
@@ -283,6 +335,7 @@ mod tests {
             r#"Bearer realm="example""#,
             r#"Bearer realm="urn:example:registry""#,
             r#"Bearer realm="https://auth.example/token?a=one,two",service="registry",scope="repository:team/file:pull""#,
+            r#"Bearer realm="https://auth.example/a%20b""#,
             "Negotiate YIIFhgYGKwYBBQUCoIIFdzCCBXOg",
             r#"Bearer realm = "https://auth.example/token",service = "registry""#,
             r#"Digest realm="registry",qop="auth,auth-int",nonce="n1""#,
@@ -309,6 +362,8 @@ mod tests {
             "Bearer realm=\"file:///etc/passwd\"",
             "Bearer realm=\"//auth.example/token\"",
             "Bearer realm=\"https://auth.example/token\",broken=\"unterminated",
+            "Bearer realm=\"https://auth.example/token%\"",
+            "Bearer realm=\"https://auth.example/a b\"",
             "Bearer realm=\"https://auth.example/token\",",
             "B@sic token",
             "Basic realm=\"registry\" garbage",
