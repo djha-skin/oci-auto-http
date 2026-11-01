@@ -48,5 +48,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cross
-      - run: cross test --locked --target ${{ matrix.target }}
+      - run: cross test --locked --lib --target ${{ matrix.target }}
+      - run: cross test --locked --no-run --target ${{ matrix.target }}
+      - run: cross run --locked --release --target ${{ matrix.target }} --bin oci-auto-http -- --help
       - run: cross build --locked --release --target ${{ matrix.target }}

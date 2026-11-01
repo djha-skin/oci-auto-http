@@ -33,7 +33,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           manifest_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f 2)"
           test "$version" = "$manifest_version"
-      - run: cross test --locked --target ${{ matrix.target }}
+      - run: cross test --locked --lib --target ${{ matrix.target }}
+      - run: cross test --locked --no-run --target ${{ matrix.target }}
+      - run: cross run --locked --release --target ${{ matrix.target }} --bin oci-auto-http -- --help
       - run: cross build --locked --release --target ${{ matrix.target }}
       - name: Assemble binary archive and checksum
         shell: bash

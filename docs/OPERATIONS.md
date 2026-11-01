@@ -12,7 +12,7 @@ The release workflow builds and smoke-tests these GNU/Linux targets:
 | `aarch64-unknown-linux-gnu` | 64-bit ARM Linux with glibc, including 64-bit Raspberry Pi OS |
 | `armv7-unknown-linux-gnueabihf` | 32-bit ARM hard-float Linux (ARMv7) |
 
-ARMv6/soft-float, musl, macOS, Windows, and other targets are not built or claimed by this workflow. Cross-target CI uses QEMU smoke tests; these are not measurements on physical ARM hardware. Build/release artifacts are versioned tarballs with SHA-256 sidecars, containing the binary, Rust source/build metadata, license, container/systemd assets, example configs, and operator/conformance docs.
+ARMv6/soft-float, musl, macOS, Windows, and other targets are not built or claimed by this workflow. Cross-target CI runs library tests under QEMU, compiles all test targets, and runs the target binary's `--help` smoke; the full subprocess CLI/HTTP integration suite runs on native x86_64 CI. QEMU checks are not measurements on physical ARM hardware. Build/release artifacts are versioned tarballs with SHA-256 sidecars, containing the binary, Rust source/build metadata, license, container/systemd assets, example configs, and operator/conformance docs.
 
 For a source build on a supported host:
 
