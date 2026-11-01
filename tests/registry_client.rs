@@ -2285,6 +2285,26 @@ async fn serve_bounds_inflight_streams_and_releases_request_permits() {
         proxy_requests_before_saturated,
         "a saturated request must be rejected before registry work"
     );
+    let cleartext_credential = http_request(
+        address,
+        "GET",
+        "/files/large.bin",
+        &[("Authorization", BASIC_AUTH)],
+    )
+    .unwrap();
+    assert_eq!(cleartext_credential.status, 403);
+    let duplicate_credentials = http_request(
+        address,
+        "GET",
+        "/files/large.bin",
+        &[
+            ("Authorization", BASIC_AUTH),
+            ("Authorization", "Basic d3Jvbmc6cGFzcw=="),
+        ],
+    )
+    .unwrap();
+    assert_eq!(duplicate_credentials.status, 400);
+    assert_eq!(proxy.total_requests(), proxy_requests_before_saturated);
     drop(open_response);
     let release_deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -2507,6 +2527,105 @@ async fn tree_page_overflow_builds_ordered_bounded_branch_pages() {
 }
 
 #[tokio::test]
+async fn tree_rejects_branch_chains_beyond_the_documented_depth_limit() {
+    const MAX_BRANCH_DEPTH: usize = 64;
+    let registry = TestRegistry::new(false);
+    let path = StoragePath::parse_relative("entry.txt").unwrap();
+    let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    tree.write_file(&path, Bytes::from_static(b"depth fixture"), false, None)
+        .await
+        .unwrap();
+    drop(tree);
+
+    let client = registry.client(ClientPolicy::default());
+    let leaf = client
+        .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+        .await
+        .unwrap();
+    let valid_root = install_single_child_branch_chain(
+        &registry,
+        &client,
+        leaf.digest.clone(),
+        leaf.size,
+        MAX_BRANCH_DEPTH,
+    )
+    .await;
+    let valid_tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let stat = valid_tree.stat_file(&path, None).await.unwrap();
+    assert_eq!(stat.size, b"depth fixture".len() as u64);
+    let page = valid_tree
+        .list_page(&StoragePath::root(), 10, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].name, "entry.txt");
+    valid_tree
+        .write_file(
+            &path,
+            Bytes::from_static(b"updated at max depth"),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        client
+            .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+            .await
+            .unwrap()
+            .digest,
+        valid_root
+    );
+    drop(valid_tree);
+
+    let too_deep_root = install_single_child_branch_chain(
+        &registry,
+        &client,
+        leaf.digest.clone(),
+        leaf.size,
+        MAX_BRANCH_DEPTH + 1,
+    )
+    .await;
+    let too_deep_tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
+    let leaf_manifest_path = format!(
+        "/v2/{}/manifests/{}",
+        registry.mount.repository, leaf.digest
+    );
+    let leaf_reads_before = registry.request_count_for_path(&leaf_manifest_path);
+
+    assert!(matches!(
+        too_deep_tree.stat_file(&path, None).await,
+        Err(TreeError::IndexDepthLimit)
+    ));
+    assert!(matches!(
+        too_deep_tree
+            .list_page(&StoragePath::root(), 10, None, None)
+            .await,
+        Err(TreeError::IndexDepthLimit)
+    ));
+    assert!(matches!(
+        too_deep_tree
+            .write_file(&path, Bytes::from_static(b"must not publish"), true, None)
+            .await,
+        Err(TreeError::IndexDepthLimit)
+    ));
+    assert_eq!(
+        registry.request_count_for_path(&leaf_manifest_path),
+        leaf_reads_before,
+        "an over-depth traversal must reject before fetching the leaf beyond the bound"
+    );
+    assert_eq!(
+        client
+            .resolve_tag(&registry.mount.root_tag, &[OCI_IMAGE_INDEX], None)
+            .await
+            .unwrap()
+            .digest,
+        too_deep_root,
+        "a rejected mutation must preserve the root tag"
+    );
+}
+
+#[tokio::test]
 async fn tree_failed_content_stream_does_not_publish_a_new_root() {
     let registry = TestRegistry::new(false);
     let tree = TreeStore::new(registry.client(ClientPolicy::default())).unwrap();
@@ -2662,6 +2781,68 @@ fn parse_listing(output: Output) -> Vec<serde_json::Value> {
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_slice(line).unwrap())
         .collect()
+}
+
+async fn install_single_child_branch_chain(
+    registry: &TestRegistry,
+    client: &RegistryClient,
+    child_digest: Digest,
+    child_size: u64,
+    branch_edges: usize,
+) -> Digest {
+    const NODE_KIND_ANNOTATION: &str = "io.github.djha-skin.oci-auto-http.node-kind";
+    const FORMAT_VERSION_ANNOTATION: &str = "io.github.djha-skin.oci-auto-http.format-version";
+    const FIRST_NAME_ANNOTATION: &str = "io.github.djha-skin.oci-auto-http.first-name";
+    const LAST_NAME_ANNOTATION: &str = "io.github.djha-skin.oci-auto-http.last-name";
+
+    assert!(branch_edges > 0);
+    let mut child_digest = child_digest;
+    let mut child_size = child_size;
+    let mut top_manifest = None;
+    for _ in 0..branch_edges {
+        let bytes = Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_IMAGE_INDEX,
+                "manifests": [{
+                    "mediaType": OCI_IMAGE_INDEX,
+                    "digest": child_digest.to_string(),
+                    "size": child_size,
+                    "annotations": {
+                        (FIRST_NAME_ANNOTATION): "entry.txt",
+                        (LAST_NAME_ANNOTATION): "entry.txt"
+                    }
+                }],
+                "annotations": {
+                    (NODE_KIND_ANNOTATION): "directory-branch",
+                    (FORMAT_VERSION_ANNOTATION): "1"
+                }
+            }))
+            .unwrap(),
+        );
+        child_digest = Digest::from_bytes(&bytes);
+        child_size = bytes.len() as u64;
+        client
+            .put_manifest(
+                &ManifestReference::Digest(child_digest.clone()),
+                OCI_IMAGE_INDEX,
+                bytes.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        top_manifest = Some(bytes);
+    }
+    client
+        .put_manifest(
+            &ManifestReference::Tag(registry.mount.root_tag.clone()),
+            OCI_IMAGE_INDEX,
+            top_manifest.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    child_digest
 }
 
 fn curl_tree_file(registry: &TestRegistry, path: &[&str]) -> Vec<u8> {
@@ -3286,6 +3467,20 @@ impl TestRegistry {
             String::from_utf8_lossy(&output.stderr)
         );
         logs.matches(&format!("/v2/{repository}/")).count()
+    }
+
+    fn request_count_for_path(&self, path: &str) -> usize {
+        let output = Command::new("docker")
+            .args(["logs", &self.container])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "docker logs failed");
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        logs.matches(path).count()
     }
 }
 

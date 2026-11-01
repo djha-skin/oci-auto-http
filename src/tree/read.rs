@@ -9,8 +9,8 @@ use crate::registry::{
 };
 
 use super::{
-    DirectoryEntry, DirectoryPage, EntryKind, MAX_FILE_CONFIG_BYTES, PageRef, StoragePath,
-    TreeError, TreeFile, TreeStore, cursor,
+    DirectoryEntry, DirectoryPage, EntryKind, MAX_FILE_CONFIG_BYTES, MAX_INDEX_DEPTH, PageRef,
+    StoragePath, TreeError, TreeFile, TreeStore, cursor,
     format::{FileConfig, FileManifest, IndexKind, OciDescriptor, OciIndex},
 };
 
@@ -321,6 +321,7 @@ impl TreeStore {
                     name,
                     stale_cursor,
                     authorization,
+                    0,
                     &mut HashSet::new(),
                 )
                 .await?
@@ -342,11 +343,15 @@ impl TreeStore {
         name: &'a str,
         stale_cursor: bool,
         authorization: Option<&'a HeaderValue>,
+        depth: usize,
         visited: &'a mut HashSet<Digest>,
     ) -> Pin<
         Box<dyn std::future::Future<Output = Result<Option<OciDescriptor>, TreeError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if depth > MAX_INDEX_DEPTH {
+                return Err(TreeError::IndexDepthLimit);
+            }
             let digest = page.descriptor.digest()?;
             if !visited.insert(digest.clone()) {
                 return Err(TreeError::IntegrityError);
@@ -368,8 +373,15 @@ impl TreeStore {
                         return Ok(None);
                     };
                     let child = page_ref_from_branch_child(child)?;
-                    self.find_page_entry(&child, name, stale_cursor, authorization, visited)
-                        .await
+                    self.find_page_entry(
+                        &child,
+                        name,
+                        stale_cursor,
+                        authorization,
+                        depth + 1,
+                        visited,
+                    )
+                    .await
                 }
             }
         })
@@ -380,10 +392,13 @@ impl TreeStore {
         root: &PageRef,
         listing: &mut ListingCollector<'_>,
     ) -> Result<(), TreeError> {
-        let mut stack = vec![root.clone()];
-        while let Some(page) = stack.pop() {
+        let mut stack = vec![(root.clone(), 0_usize)];
+        while let Some((page, depth)) = stack.pop() {
             if listing.entries.len() >= listing.limit {
                 break;
+            }
+            if depth > MAX_INDEX_DEPTH {
+                return Err(TreeError::IndexDepthLimit);
             }
             let digest = page.descriptor.digest()?;
             if !listing.visited.insert(digest) {
@@ -433,7 +448,7 @@ impl TreeStore {
                         }
                         children.push(page_ref_from_branch_child(descriptor)?);
                     }
-                    stack.extend(children.into_iter().rev());
+                    stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
                 }
             }
         }

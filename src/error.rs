@@ -98,9 +98,10 @@ fn tree_exit_code(error: &TreeError) -> u8 {
         | TreeError::NotDirectory
         | TreeError::NotFile => 73,
         TreeError::StaleCursor | TreeError::CommitOutcomeUnknown => 75,
-        TreeError::InvalidFileSize | TreeError::InvalidFileContent | TreeError::IntegrityError => {
-            65
-        }
+        TreeError::InvalidFileSize
+        | TreeError::InvalidFileContent
+        | TreeError::IntegrityError
+        | TreeError::IndexDepthLimit => 65,
         TreeError::Registry(error) => registry_exit_code(error),
         TreeError::InvalidMountTarget => 78,
         TreeError::InputStream => 74,

@@ -110,12 +110,12 @@ pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
         .route("/healthz", get(health).head(health))
         .fallback(route_request)
         .layer(middleware::from_fn_with_state(
-            secure_listener,
-            enforce_authorization_transport,
-        ))
-        .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_limits,
+        ))
+        .layer(middleware::from_fn_with_state(
+            secure_listener,
+            enforce_authorization_transport,
         ))
         .with_state(state.clone());
 
