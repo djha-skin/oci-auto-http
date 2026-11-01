@@ -2,7 +2,8 @@ use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::{cli::ServeArgs, config::Config, error::AppError};
+use crate::cli::ServeArgs;
+use oci_auto_http::{config::Config, error::AppError};
 
 pub async fn serve(args: ServeArgs) -> Result<(), AppError> {
     let mut config = Config::load(&args.config)?;

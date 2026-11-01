@@ -1,8 +1,8 @@
 use crate::{
     cli::{ArtifactCommand, Command, MountCommand},
-    error::AppError,
     server,
 };
+use oci_auto_http::error::AppError;
 
 pub async fn run(command: Command) -> Result<(), AppError> {
     match command {

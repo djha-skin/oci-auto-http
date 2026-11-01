@@ -1,6 +1,7 @@
 use tracing_subscriber::EnvFilter;
 
-use crate::{cli::LogFormat, error::AppError};
+use crate::cli::LogFormat;
+use oci_auto_http::error::AppError;
 
 pub fn init(format: LogFormat) -> Result<(), AppError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

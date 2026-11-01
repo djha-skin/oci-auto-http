@@ -431,7 +431,11 @@ fn request_until_ready(child: &mut Child, address: SocketAddr, method: &str, pat
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("server exited before serving request: {status}");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                pipe.read_to_string(&mut stderr).unwrap();
+            }
+            panic!("server exited before serving request: {status}; stderr: {stderr}");
         }
         if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             stream

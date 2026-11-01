@@ -2,8 +2,6 @@
 
 mod cli;
 mod commands;
-mod config;
-mod error;
 mod logging;
 mod server;
 
@@ -11,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use cli::{Cli, LogFormat};
-use error::AppError;
+use oci_auto_http::error::AppError;
 
 #[tokio::main]
 async fn main() -> ExitCode {

@@ -26,6 +26,14 @@ Configuration is version-1 TOML. `version` is required; `[server].listen` defaul
 
 The package requires Rust 1.88 or newer.
 
+## OCI Distribution client library
+
+The crate exposes `oci_auto_http::registry::RegistryClient` for repository-scoped OCI Distribution v2 operations. Construct a validated `config::Mount` through `config::Config::load` or `Config::parse`, then create the client with `RegistryClient::new(mount, ClientPolicy::default())`. The boundary provides tag resolution, manifest GET/PUT/DELETE, blob HEAD/streaming GET/PUT/DELETE, and bounded paginated tag listing. It supports OCI indexes and image/artifact manifests through their media types; it does not call `_catalog` or infer tree paths from registry names.
+
+The module re-exports `Bytes`, `Stream`, and `HeaderValue` for callers of these APIs. Pass an optional `registry::HeaderValue` Authorization value to an operation. It is sent only to the configured HTTPS registry origin and is never forwarded to an allowlisted blob redirect. Upstream 401 challenges and `Retry-After` are exposed on `RegistryError` for exact HTTP relay, while its `Display` and `Debug` output omit headers, URLs, and response bodies. Blob GET returns a streaming body that checks the descriptor digest and size when fully consumed; blob uploads stream through an OCI PATCH session, verify the declared digest/size, then finalize with a separate PUT. Buffered manifests and tag pages are bounded (1 MiB by default, configurable up to 16 MiB); GET/HEAD use at most two retries by default, all writes are non-retryable, requests time out after 30 seconds, and blob redirects are manually constrained to HTTPS and exact configured authorities. Private-registry CA certificates can be supplied through `ClientPolicy::with_root_certificate_pem`.
+
+This library boundary is not yet wired into the `serve`, `artifact`, or `mount` commands; those integrations follow in the storage and routing work. The currently implemented listener still returns `503` for mounted paths.
+
 Use `--log-format text` (default) or `--log-format json` to select stderr logging. `RUST_LOG` controls the tracing filter; invalid filters fall back to `info`. Credentials and request data are not accepted as command-line arguments.
 
 Run `oci-auto-http <command> --help` for command-specific usage. Invalid command syntax exits `2`; reserved commands exit `69` (`EX_UNAVAILABLE`) with a diagnostic and make no registry request.
